@@ -1,6 +1,10 @@
 from fastapi import FastAPI
 from typing import Dict, Any, List
 
+from app.routes.groups_routes import GroupsRoute
+from app.routes.logs_routes import LogsRoute
+from app.routes.model_routes import ModelRoute
+
 
 class RouteManager:
     """
@@ -25,7 +29,11 @@ class RouteManager:
         """
 
         # Lista de classes de rotas disponíveis
-        route_classes = []
+        route_classes = [
+            ModelRoute,
+            LogsRoute,
+            GroupsRoute
+        ]
 
         # Registra cada conjunto de rotas
         for route_class in route_classes:

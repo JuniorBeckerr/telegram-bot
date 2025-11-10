@@ -59,7 +59,7 @@ CREATE TABLE media (
                        group_id BIGINT NOT NULL,
                        telegram_file_id VARCHAR(255),
                        sha256_hex CHAR(64) NOT NULL,             -- hash exato
-                       phash BIGINT,                             -- perceptual hash
+                       phash varchar(32),                             -- perceptual hash
                        mime VARCHAR(100),
                        width INT,
                        height INT,

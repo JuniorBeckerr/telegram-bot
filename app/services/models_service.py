@@ -6,6 +6,52 @@ class ModelsService:
     def __init__(self):
         self.repo = ModelsRepository()
 
+    def index(self):
+        data = self.repo.all()
+        for item in data:
+            aliases = item.get("aliases")
+            if aliases:
+                try:
+                    # remove chaves e converte para lista
+                    parsed = json.loads(aliases.replace("{", "[").replace("}", "]"))
+                    item["aliases"] = parsed
+                except Exception:
+                    # fallback em caso de erro
+                    item["aliases"] = []
+            else:
+                item["aliases"] = []
+        return data
+
+    def show(self, id):
+        data = self.repo.find(id)
+        aliases = data.get("aliases")
+        if aliases:
+            try:
+                # remove chaves e converte para lista
+                parsed = json.loads(aliases.replace("{", "[").replace("}", "]"))
+                data["aliases"] = parsed
+            except Exception:
+                # fallback em caso de erro
+                data["aliases"] = []
+        else:
+            data["aliases"] = []
+        return data
+
+    def store(self, data):
+        if isinstance(data.get('aliases'), list):
+            data['aliases'] = json.dumps(data['aliases'])
+        return self.repo.create(data)
+
+    def update(self, data, id):
+
+        if isinstance(data.get('aliases'), list):
+            data['aliases'] = json.dumps(data['aliases'])
+        return self.repo.update(id, data)
+
+    def destroy(self, id):
+        return self.repo.delete(id)
+
+
     def get_or_create(self, stage_name: str):
         """Busca um modelo existente ou cria novo."""
         return self.repo.first_or_create({"stage_name": stage_name})

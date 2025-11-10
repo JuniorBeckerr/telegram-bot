@@ -11,3 +11,5 @@ python-dotenv==1.2.1
 pytz==2025.2
 telethon==1.41.2
 uvicorn==0.38.0
+orjson
+cryptography

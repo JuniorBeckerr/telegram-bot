@@ -9,6 +9,22 @@ class GroupsService:
         self.group_credentials = GroupCredentialsRepository()
         self.credentials = CredentialsRepository()
 
+    def index(self):
+        return self.groups.all()
+
+    def show(self, id):
+        return self.groups.find(id)
+
+    def store(self, data):
+        return self.groups.create(data)
+
+    def update(self, data, id):
+        return self.groups.update(id, data)
+
+    def destroy(self, id):
+        return self.groups.delete(id)
+
+
     def get_enabled_groups(self):
         """Retorna todos os grupos ativos."""
         return self.groups.active()

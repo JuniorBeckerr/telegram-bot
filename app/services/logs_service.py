@@ -4,6 +4,13 @@ class LogsService:
     def __init__(self):
         self.repo = ProcessLogsRepository()
 
+    def index(self):
+        return self.repo.all()
+
+    def show(self, id):
+        return self.repo.find(id)
+
+
     def success(self, media_id: int, group_id: int, step: str, msg: str = None):
         return self.repo.log_success(media_id, group_id, step, msg)
 

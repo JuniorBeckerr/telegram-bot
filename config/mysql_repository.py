@@ -296,10 +296,10 @@ class QueryBuilder:
     def _build_query(self, for_count=False):
         """Constrói a query SQL com base nos parâmetros"""
         if for_count:
-            query = f"SELECT COUNT(*) as count FROM {self.table_name}"
+            query = f"SELECT COUNT(*) as count FROM `{self.table_name}`"
         else:
             columns = ', '.join(self.select_columns)
-            query = f"SELECT {columns} FROM {self.table_name}"
+            query = f"SELECT {columns} FROM `{self.table_name}`"
 
         # Adiciona JOINs
         if self.joins:
@@ -440,7 +440,7 @@ class QueryBuilder:
         connection = None
         cursor = None
         try:
-            query = f"SELECT {aggregate_function}({field}) as aggregate FROM {self.table_name}"
+            query = f"SELECT {aggregate_function}({field}) as aggregate FROM `{self.table_name}`"
 
             # Adiciona JOINs
             if self.joins:
@@ -574,7 +574,7 @@ class QueryBuilder:
                 fields = ', '.join(data.keys())
                 placeholders = ', '.join(['%s'] * len(data))
 
-                query = f"INSERT INTO {self.table_name} ({fields}) VALUES ({placeholders})"
+                query = f"INSERT INTO `{self.table_name}` ({fields}) VALUES ({placeholders})"
                 values = list(data.values())
 
                 connection = MySQL.get_connection()
@@ -620,7 +620,7 @@ class QueryBuilder:
             set_clause = ', '.join([f"{field} = %s" for field in update_data.keys()])
             update_values = list(update_data.values())
 
-            query = f"UPDATE {self.table_name} SET {set_clause}"
+            query = f"UPDATE `{self.table_name}` SET {set_clause}"
             params = update_values
 
             # Adiciona condições WHERE
@@ -657,7 +657,7 @@ class QueryBuilder:
         connection = None
         cursor = None
         try:
-            query = f"DELETE FROM {self.table_name}"
+            query = f"DELETE FROM `{self.table_name}`"
 
             # Adiciona condições WHERE
             if self.conditions:
@@ -827,7 +827,7 @@ class BaseRepository:
             fields = ', '.join(data.keys())
             placeholders = ', '.join(['%s'] * len(data))
 
-            query = f"INSERT INTO {self.table_name} ({fields}) VALUES ({placeholders})"
+            query = f"INSERT INTO `{self.table_name}` ({fields}) VALUES ({placeholders})"
             values = list(data.values())
 
             connection = MySQL.get_connection()
@@ -875,7 +875,7 @@ class BaseRepository:
 
             # Constrói a query UPDATE
             set_clause = ', '.join([f"{field} = %s" for field in data.keys()])
-            query = f"UPDATE {self.table_name} SET {set_clause} WHERE {self.primary_key} = %s"
+            query = f"UPDATE `{self.table_name}` SET {set_clause} WHERE {self.primary_key} = %s"
 
             values = list(data.values())
             values.append(id)
@@ -906,7 +906,7 @@ class BaseRepository:
         try:
             if id is not None:
                 # Deleta por ID
-                query = f"DELETE FROM {self.table_name} WHERE {self.primary_key} = %s"
+                query = f"DELETE FROM `{self.table_name}` WHERE {self.primary_key} = %s"
                 values = [id]
 
                 connection = MySQL.get_connection()
@@ -1166,7 +1166,7 @@ class BaseRepository:
 
             # Constrói a query UPDATE
             query = f"""
-                UPDATE {self.table_name}
+                UPDATE `{self.table_name}`
                 SET {field} = {field} + %s, updated_at = %s
                 WHERE {where_clause}
             """
@@ -1355,7 +1355,7 @@ class BaseRepository:
 
                     # Constrói a query UPDATE
                     set_clause = ', '.join([f"{field} = %s" for field in update_data.keys()])
-                    query = f"UPDATE {self.table_name} SET {set_clause} WHERE {self.primary_key} = %s"
+                    query = f"UPDATE `{self.table_name}` SET {set_clause} WHERE {self.primary_key} = %s"
 
                     values = list(update_data.values())
                     values.append(id_value)
@@ -1375,7 +1375,7 @@ class BaseRepository:
                     # Constrói a query INSERT
                     fields = ', '.join(update_data.keys())
                     placeholders = ', '.join(['%s'] * len(update_data))
-                    query = f"INSERT INTO {self.table_name} ({fields}) VALUES ({placeholders})"
+                    query = f"INSERT INTO `{self.table_name}` ({fields}) VALUES ({placeholders})"
 
                     values = list(update_data.values())
 
