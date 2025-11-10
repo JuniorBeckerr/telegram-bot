@@ -2,7 +2,7 @@ from openai import OpenAI
 import os
 from dotenv import load_dotenv
 
-API_KEY1= os.getenv('API_KEY_1')
+API_KEY1= os.getenv('API_KEY_2')
 client = OpenAI(api_key=API_KEY1)
 
 def extract_name_from_image(img_b64: str):
