@@ -102,58 +102,87 @@ class TelegramService:
         return msgs
 
     def _worker_process(self, idx, group, msg_ids, cred, result_queue):
-        """Processo individual de um worker (executa mensagens em paralelo)."""
-
+        """Processo individual de um worker com rate-limit global e reconexão."""
         async def job():
             from app.services.pipeline_service import PipelineService
             pipeline = PipelineService()
+
             session_path = os.path.join(self.session_path, f"sessao_{idx}")
             client = TelegramClient(session_path, cred["api_id"], cred["api_hash"])
+            await client.connect()
 
-            # reconexão robusta
-            async def connect_client():
-                for attempt in range(3):
-                    try:
-                        await client.connect()
-                        if await client.is_user_authorized():
-                            return True
-                    except Exception as e:
-                        print(f"[W{idx}] ⚠️ Erro conectando Telegram: {e}")
-                    await asyncio.sleep(3 * (attempt + 1))
-                return False
-
-            if not await connect_client():
-                print(f"[W{idx}] ❌ Falha ao autenticar sessão.")
+            if not await client.is_user_authorized():
+                print(f"[W{idx}] ❌ Sessão não autenticada.")
                 result_queue.put(0)
                 return
 
-            entity = await safe_telegram_call(client.get_entity, group["id"])
+            entity = await client.get_entity(group["id"])
             start_time = time.time()
-            semaphore = asyncio.Semaphore(2)
-            processed_count = 0
             last_processed_id = 0
+            processed_count = 0
+
+            # 🔹 Rate limiter global — controla requisições simultâneas
+            rate_limiter = asyncio.Semaphore(3)
+
+            async def safe_call(func, *args, **kwargs):
+                """Wrapper que trata flood e reconexões."""
+                async with rate_limiter:
+                    for attempt in range(5):
+                        try:
+                            return await func(*args, **kwargs)
+                        except FloodWaitError as e:
+                            wait_for = int(getattr(e, "seconds", 10))
+                            print(f"[W{idx}] ⚠️ FloodWait: aguardando {wait_for}s...")
+                            await asyncio.sleep(wait_for)
+                        except RPCError as e:
+                            if "disconnected" in str(e).lower() or not client.is_connected():
+                                print(f"[W{idx}] ⚠️ RPC desconectado, tentando reconectar...")
+                                await client.disconnect()
+                                await asyncio.sleep(3)
+                                await client.connect()
+                            else:
+                                raise
+                        except Exception as e:
+                            if "disconnected" in str(e).lower() or "Cannot send requests" in str(e):
+                                print(f"[W{idx}] ⚠️ Reconectando cliente após desconexão...")
+                                await asyncio.sleep(5)
+                                try:
+                                    await client.disconnect()
+                                    await asyncio.sleep(2)
+                                    await client.connect()
+                                except Exception:
+                                    pass
+                                continue
+                            if attempt == 4:
+                                print(f"[W{idx}] ❌ Erro persistente: {e}")
+                            else:
+                                await asyncio.sleep(3)
 
             async def process_single(msg_id):
                 nonlocal last_processed_id, processed_count
-                async with semaphore:
-                    try:
-                        msg = await safe_telegram_call(client.get_messages, entity, ids=msg_id)
-                        if not msg or not msg.media:
-                            return
+                try:
+                    msg = await safe_call(client.get_messages, entity, ids=msg_id)
+                    if not msg or not msg.media:
+                        return
 
-                        file = await safe_telegram_call(msg.download_media, bytes)
-                        mime = msg.file.mime_type or "application/octet-stream"
-                        await pipeline.process_message(msg, file, mime, group, worker_id=idx)
+                    file = await safe_call(msg.download_media, bytes)
+                    if not file:
+                        print(f"[W{idx}] ⚠️ Falha no download da msg {msg_id}")
+                        return
 
-                        last_processed_id = max(last_processed_id, msg.id)
-                        processed_count += 1
-                    except Exception as e:
-                        print(f"[W{idx}] ⚠️ Erro processando msg {msg_id}: {e}")
+                    mime = msg.file.mime_type or "application/octet-stream"
+                    await pipeline.process_message(msg, file, mime, group, worker_id=idx)
+                    last_processed_id = max(last_processed_id, msg.id)
+                    processed_count += 1
 
+                except Exception as e:
+                    print(f"[W{idx}] ⚠️ Erro processando msg {msg_id}: {e}")
+
+            # 🔹 processa mensagens de forma controlada
             await asyncio.gather(*[process_single(m) for m in msg_ids])
+            elapsed = time.time() - start_time
             await client.disconnect()
 
-            elapsed = time.time() - start_time
             print(f"[W{idx}] ✅ Processadas {processed_count}/{len(msg_ids)} mensagens em {elapsed:.2f}s")
             result_queue.put(last_processed_id)
 
