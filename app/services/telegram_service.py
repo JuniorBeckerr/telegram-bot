@@ -4,10 +4,40 @@ import asyncio
 import time
 import multiprocessing
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError, RpcError
 from app.repository.groups_repository import GroupsRepository
 from app.repository.credentials_repository import CredentialsRepository
 from app.repository.group_credentials_repository import GroupCredentialsRepository
 from config.settings import Config
+
+# 🚦 Limite global de chamadas Telegram simultâneas
+TELEGRAM_SEMAPHORE = asyncio.Semaphore(5)
+
+
+async def safe_telegram_call(func, *args, retries=3, **kwargs):
+    """Executa chamadas Telegram com limite global e retry/backoff em 429."""
+    async with TELEGRAM_SEMAPHORE:
+        for attempt in range(retries):
+            try:
+                return await func(*args, **kwargs)
+            except FloodWaitError as e:
+                print(f"⚠️ FloodWait: aguardando {e.seconds}s antes de tentar novamente...")
+                await asyncio.sleep(e.seconds + 1)
+            except RpcError as e:
+                if "429" in str(e) or "flood" in str(e).lower():
+                    wait_time = 5 * (attempt + 1)
+                    print(f"⚠️ Flood control detectado ({e}). Tentando novamente em {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    raise
+            except Exception as e:
+                if "429" in str(e) or "flood" in str(e).lower():
+                    wait_time = 5 * (attempt + 1)
+                    print(f"⚠️ Erro 429: aguardando {wait_time}s antes de tentar novamente...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    raise
+        raise Exception(f"❌ Falha após {retries} tentativas em {func.__name__}")
 
 
 class TelegramService:
@@ -62,7 +92,7 @@ class TelegramService:
         last_id = group.get("last_update_id", 0)
         print(f"📦 Buscando {total_to_fetch} mensagens após ID {last_id} do grupo {group['title']}...")
 
-        entity = await client.get_entity(group["id"])
+        entity = await safe_telegram_call(client.get_entity, group["id"])
         msgs = []
         async for m in client.iter_messages(entity, limit=total_to_fetch, offset_id=last_id, reverse=True):
             if m.media:
@@ -73,46 +103,57 @@ class TelegramService:
 
     def _worker_process(self, idx, group, msg_ids, cred, result_queue):
         """Processo individual de um worker (executa mensagens em paralelo)."""
+
         async def job():
             from app.services.pipeline_service import PipelineService
             pipeline = PipelineService()
-
             session_path = os.path.join(self.session_path, f"sessao_{idx}")
             client = TelegramClient(session_path, cred["api_id"], cred["api_hash"])
-            await client.connect()
 
-            if not await client.is_user_authorized():
-                print(f"[W{idx}] ❌ Sessão não autenticada.")
+            # reconexão robusta
+            async def connect_client():
+                for attempt in range(3):
+                    try:
+                        await client.connect()
+                        if await client.is_user_authorized():
+                            return True
+                    except Exception as e:
+                        print(f"[W{idx}] ⚠️ Erro conectando Telegram: {e}")
+                    await asyncio.sleep(3 * (attempt + 1))
+                return False
+
+            if not await connect_client():
+                print(f"[W{idx}] ❌ Falha ao autenticar sessão.")
                 result_queue.put(0)
                 return
 
-            entity = await client.get_entity(group["id"])
+            entity = await safe_telegram_call(client.get_entity, group["id"])
             start_time = time.time()
-            semaphore = asyncio.Semaphore(3)
-
-            last_processed_id = 0
+            semaphore = asyncio.Semaphore(2)
             processed_count = 0
+            last_processed_id = 0
 
             async def process_single(msg_id):
                 nonlocal last_processed_id, processed_count
                 async with semaphore:
                     try:
-                        msg = await client.get_messages(entity, ids=msg_id)
+                        msg = await safe_telegram_call(client.get_messages, entity, ids=msg_id)
                         if not msg or not msg.media:
                             return
 
-                        file = await msg.download_media(bytes)
+                        file = await safe_telegram_call(msg.download_media, bytes)
                         mime = msg.file.mime_type or "application/octet-stream"
                         await pipeline.process_message(msg, file, mime, group, worker_id=idx)
+
                         last_processed_id = max(last_processed_id, msg.id)
                         processed_count += 1
                     except Exception as e:
                         print(f"[W{idx}] ⚠️ Erro processando msg {msg_id}: {e}")
 
             await asyncio.gather(*[process_single(m) for m in msg_ids])
-            elapsed = time.time() - start_time
             await client.disconnect()
 
+            elapsed = time.time() - start_time
             print(f"[W{idx}] ✅ Processadas {processed_count}/{len(msg_ids)} mensagens em {elapsed:.2f}s")
             result_queue.put(last_processed_id)
 
@@ -159,7 +200,6 @@ class TelegramService:
         for p in processes:
             p.join()
 
-        # coleta o último ID realmente processado com sucesso
         processed_ids = []
         while not result_queue.empty():
             processed_ids.append(result_queue.get())
