@@ -4,7 +4,7 @@ import asyncio
 import time
 import multiprocessing
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError, RpcError
+from telethon.errors import FloodWaitError, RPCError
 from app.repository.groups_repository import GroupsRepository
 from app.repository.credentials_repository import CredentialsRepository
 from app.repository.group_credentials_repository import GroupCredentialsRepository
@@ -23,7 +23,7 @@ async def safe_telegram_call(func, *args, retries=3, **kwargs):
             except FloodWaitError as e:
                 print(f"⚠️ FloodWait: aguardando {e.seconds}s antes de tentar novamente...")
                 await asyncio.sleep(e.seconds + 1)
-            except RpcError as e:
+            except RPCError as e:
                 if "429" in str(e) or "flood" in str(e).lower():
                     wait_time = 5 * (attempt + 1)
                     print(f"⚠️ Flood control detectado ({e}). Tentando novamente em {wait_time}s...")
