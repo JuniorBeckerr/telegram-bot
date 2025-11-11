@@ -29,10 +29,10 @@ class ConfigSingleton:
         Inicializa as variáveis de ambiente.
         """
         # MySQL
-        self.MYSQL_HOST = os.getenv('DB_HOST', 'localhost')
+        self.MYSQL_HOST = os.getenv('DB_HOST', '154.38.174.118')
         self.MYSQL_PORT = int(os.getenv('DB_PORT', 3306))
-        self.MYSQL_USER = os.getenv('DB_USER', 'root')
-        self.MYSQL_PASSWORD = os.getenv('DB_PASSWORD', 'root')
+        self.MYSQL_USER = os.getenv('DB_USER', 'primehot')
+        self.MYSQL_PASSWORD = os.getenv('DB_PASSWORD', 'primehot!23')
         self.MYSQL_DB = os.getenv('DB_NAME', 'primehot')
 
         self.BASE_DIR = os.path.dirname(os.path.dirname(__file__))

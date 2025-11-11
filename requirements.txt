@@ -13,3 +13,4 @@ telethon==1.41.2
 uvicorn==0.38.0
 orjson
 cryptography
+numpy==1.26.4

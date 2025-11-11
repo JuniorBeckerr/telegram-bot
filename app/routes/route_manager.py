@@ -3,6 +3,7 @@ from typing import Dict, Any, List
 
 from app.routes.groups_routes import GroupsRoute
 from app.routes.logs_routes import LogsRoute
+from app.routes.media_routes import MediaRoute
 from app.routes.model_routes import ModelRoute
 
 
@@ -32,6 +33,7 @@ class RouteManager:
         route_classes = [
             ModelRoute,
             LogsRoute,
+            MediaRoute,
             GroupsRoute
         ]
 

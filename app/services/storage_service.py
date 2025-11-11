@@ -1,4 +1,5 @@
 import boto3
+import mimetypes
 
 DO_SPACES_KEY = "DO801N79B86DQ6HH43V6"
 DO_SPACES_SECRET = "OSKDipRfn34iIgWf1Gb8DQyQzNUuka69ghX+u7nL40E"
@@ -26,6 +27,7 @@ class StorageService:
         # 🔹 Não cria o client aqui — evita erro de pickle no multiprocessing
         self.bucket = DO_SPACES_BUCKET
         self.endpoint = DO_SPACES_ENDPOINT
+        self.region = DO_SPACES_REGION
 
     def upload_bytes(self, file_bytes: bytes, key: str, mime: str) -> str:
         """Faz upload de bytes diretamente para o Spaces."""
@@ -38,3 +40,33 @@ class StorageService:
             ACL="public-read",
         )
         return f"{self.endpoint}/{key}"
+
+
+
+    def build_public_url(self, media):
+        """
+        Gera URL pública consistente baseada no bucket e na storage_key do banco.
+        Não tenta reconstruir com base na remote_url (que pode estar errada).
+        """
+        storage_key = media.get("storage_key")
+
+        if not storage_key:
+            return None
+
+        return f"https://{self.bucket}.{self.region}.digitaloceanspaces.com/{storage_key}"
+
+    def move_file(self, old_key: str, new_key: str):
+        """Move arquivo dentro do mesmo bucket (copia + deleta)."""
+        client = _get_spaces_client()
+
+        # Copia
+        copy_source = {"Bucket": self.bucket, "Key": old_key}
+        client.copy_object(
+            Bucket=self.bucket,
+            CopySource=copy_source,
+            Key=new_key,
+            ACL="public-read"
+        )
+
+        # Deleta original
+        client.delete_object(Bucket=self.bucket, Key=old_key)
