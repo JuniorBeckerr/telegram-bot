@@ -44,8 +44,8 @@ class ConfigSingleton:
         self.JSON_DB = os.path.join(self.BASE_DIR, "processed.json")
 
         # --- CONFIGURAÇÕES DE PROCESSAMENTO ---
-        self.NUM_WORKERS = 2          # número de processos simultâneos
-        self.MSG_POR_WORKER = 500       # quantas mensagens cada worker processa
+        self.NUM_WORKERS = 3          # número de processos simultâneos
+        self.MSG_POR_WORKER = 50       # quantas mensagens cada worker processa
         self.RETRIES = 3              # número de tentativas em caso de erro
         self.OFFSET_INICIAL = 0      # deslocamento inicial de mensagens no Telegram
 
@@ -55,3 +55,4 @@ class ConfigSingleton:
         os.makedirs(self.FRAMES_PATH, exist_ok=True)
 
 Config = ConfigSingleton()
+# 📦 Buscando 2000 mensagens após ID 1502 do grupo Grupo Premium...
