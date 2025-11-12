@@ -44,8 +44,8 @@ class ConfigSingleton:
         self.JSON_DB = os.path.join(self.BASE_DIR, "processed.json")
 
         # --- CONFIGURAÇÕES DE PROCESSAMENTO ---
-        self.NUM_WORKERS = 5          # número de processos simultâneos
-        self.MSG_POR_WORKER = 100       # quantas mensagens cada worker processa
+        self.NUM_WORKERS = 2          # número de processos simultâneos
+        self.MSG_POR_WORKER = 500       # quantas mensagens cada worker processa
         self.RETRIES = 3              # número de tentativas em caso de erro
         self.OFFSET_INICIAL = 0      # deslocamento inicial de mensagens no Telegram
 
