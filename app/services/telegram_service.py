@@ -87,27 +87,25 @@ class TelegramService:
             start_time = time.time()
             last_processed_id = 0
             processed_count = 0
-            rate_limiter = asyncio.Semaphore(3)
 
             async def safe_call(func, *args, **kwargs):
-                async with rate_limiter:
-                    for attempt in range(5):
-                        try:
-                            return await func(*args, **kwargs)
-                        except FloodWaitError as e:
-                            await asyncio.sleep(e.seconds + 1)
-                        except RPCError as e:
-                            if "disconnected" in str(e).lower() or not client.is_connected():
-                                await client.disconnect()
-                                await asyncio.sleep(3)
-                                await client.connect()
-                            else:
-                                raise
-                        except Exception as e:
-                            if attempt == 4:
-                                print(f"[W{idx}] ❌ Erro persistente: {e}")
-                            else:
-                                await asyncio.sleep(3)
+                for attempt in range(5):
+                    try:
+                        return await func(*args, **kwargs)
+                    except FloodWaitError as e:
+                        await asyncio.sleep(e.seconds + 1)
+                    except RPCError as e:
+                        if "disconnected" in str(e).lower() or not client.is_connected():
+                            await client.disconnect()
+                            await asyncio.sleep(3)
+                            await client.connect()
+                        else:
+                            raise
+                    except Exception as e:
+                        if attempt == 4:
+                            print(f"[W{idx}] ❌ Erro persistente: {e}")
+                        else:
+                            await asyncio.sleep(3)
 
             async def process_single(msg_id):
                 nonlocal last_processed_id, processed_count
@@ -127,7 +125,10 @@ class TelegramService:
                 except Exception as e:
                     print(f"[W{idx}] ⚠️ Erro processando msg {msg_id}: {e}")
 
-            await asyncio.gather(*[process_single(m) for m in msg_ids])
+            # ⚡ Ajuste principal: processa sequencialmente
+            for m in msg_ids:
+                await process_single(m)
+
             await client.disconnect()
             result_queue.put(last_processed_id)
             elapsed = time.time() - start_time
