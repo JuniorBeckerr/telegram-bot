@@ -56,22 +56,44 @@ class MediaService:
         return self.media.where("sha256_hex", media_hash).first()
 
 
-    def index(self, status_list=None):
-        if status_list:
-            query = self.media.index(status_list)
-        else:
-            query = self.media.query().order_by("created_at", "desc").get()
-        for r in query:
-            r["public_url"] = self.storage.build_public_url(r)
+    def index(self, status=None, mime=None, search=None, page=1, limit=48):
+        # busca paginada no repositório
+        result = self.media.index(status=status, mime=mime, search=search, page=page, limit=limit)
+        items = result["items"]
+        media_ids = [r["id"] for r in items]
 
-        return query
+        # busca todas as classificações de uma vez
+        classifications = self.classifications.query().where_in("media_id", media_ids).all()
+
+        # cria um mapa de media_id -> [labels]
+        alias_map = {}
+        for c in classifications:
+            alias_map.setdefault(c["media_id"], []).append(c["label"])
+
+        # adiciona URLs e aliases
+        for r in items:
+            r["public_url"] = self.storage.build_public_url(r)
+            r["aliases"] = alias_map.get(r["id"], [])
+
+        # retorna no formato esperado
+        return {
+            "data": items,
+            "meta": {
+                "page": result["page"],
+                "limit": result["per_page"],
+                "total": result["total"],
+                "total_pages": result["pages"],
+            },
+        }
+
 
     def show(self, id):
         media = self.media.show(id)
         media["public_url"] = self.storage.build_public_url(media)
+        media["aliases"] = self.classifications.where("media_id", id).pluck("label")
         return media
 
-    async def approve_related_media(self, model_id: int, media_id: int, reviewed_by: str):
+    async def approve_related_media(self, model_id: int, media_id: int, reviewed_by: str, create_alias):
         # 🔹 1. Busca model e mídia base
         model = self.models.find(model_id)
         media = self.media.find(media_id)
@@ -139,7 +161,7 @@ class MediaService:
             })
 
         # 🔹 4. Atualiza aliases se label ≠ stage_name
-        if label != model["stage_name"].lower():
+        if create_alias and label != model["stage_name"].lower():
             aliases = []
             raw = model.get("aliases")
             if raw:

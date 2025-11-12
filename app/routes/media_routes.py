@@ -31,6 +31,7 @@ class MediaRoute:
             """
             model_id = payload.get("model_id")
             media_id = payload.get("media_id")
+            create_alias = payload.get("create_alias")
             reviewed_by = payload.get("reviewed_by", "system")
 
-            return await self.controller.approve_related_media(model_id, media_id, reviewed_by)
+            return await self.controller.approve_related_media(model_id, media_id, reviewed_by, create_alias)

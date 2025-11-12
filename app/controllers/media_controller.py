@@ -12,11 +12,24 @@ class MediaController:
     def index(self, request):
         try:
             status_param = request.query_params.get("status")
-            data = self.service.index(status_list=status_param)
+            mime_param = request.query_params.get("mime")
+            search_param = request.query_params.get("search")
+            page = int(request.query_params.get("page", 1))
+            limit = int(request.query_params.get("limit", 48))
+
+            data = self.service.index(
+                status=status_param,
+                mime=mime_param,
+                search=search_param,
+                page=page,
+                limit=limit
+            )
+
             return ResponseHandler.success(data, "Listagem obtida com sucesso", 200)
+
         except Exception as e:
-            logger.error(f"Erro ao listar funis: {str(e)}")
-            return ResponseHandler.error("Erro ao listar funis", 500)
+            logger.error(f"Erro ao listar mídias: {str(e)}")
+            return ResponseHandler.error("Erro ao listar mídias", 500)
 
     def show(self, id):
         try:
@@ -29,9 +42,9 @@ class MediaController:
             return ResponseHandler.error("Erro ao buscar Item", 500)
 
 
-    async def approve_related_media(self, model_id: int, media_id: int, reviewed_by: str):
+    async def approve_related_media(self, model_id: int, media_id: int, reviewed_by: str, create_alias: bool = True):
         try:
-            data = await self.service.approve_related_media(model_id, media_id, reviewed_by)
+            data = await self.service.approve_related_media(model_id, media_id, reviewed_by, create_alias)
             if not data:
                 return ResponseHandler.error("Item não encontrado", 404)
             return ResponseHandler.success(data, "Item encontrado", 200)

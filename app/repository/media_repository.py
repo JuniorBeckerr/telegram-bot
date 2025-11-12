@@ -15,9 +15,10 @@ class MediaRepository(BaseRepository):
         return self.update(media_id, {"state": state})
 
 
-    def index(self, status=None):
+    def index(self, status=None, mime=None, search=None, page=1, limit=48):
         """
-        Lista mídias com join do nome do grupo e filtro opcional por estado.
+        Lista mídias com join do nome do grupo e filtros opcionais.
+        Pagina os resultados.
         """
         query = (
             self.query()
@@ -28,9 +29,22 @@ class MediaRepository(BaseRepository):
             .left_join("`groups` AS g", "g.id", "=", "media.group_id")
             .order_by("media.created_at", "DESC")
         )
+
+        # filtros opcionais
         if status:
             query.where("media.state", status)
-        return query.get()
+
+        if mime:
+            if mime == "video":
+                query.where_like("media.mime", "video/")
+            elif mime == "image":
+                query.where_like("media.mime", "image/")
+
+        if search:
+            query.where_like("g.title", search)
+
+        # paginação usando o QueryBuilder
+        return query.paginate(page=page, per_page=limit)
 
     def show(self, id):
         """
