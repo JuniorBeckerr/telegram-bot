@@ -7,6 +7,7 @@ from telethon.errors import FloodWaitError, RPCError
 from app.repository.groups_repository import GroupsRepository
 from app.repository.credentials_repository import CredentialsRepository
 from app.repository.group_credentials_repository import GroupCredentialsRepository
+from app.repository.media_repository import MediaRepository
 from config.settings import Config
 
 TELEGRAM_SEMAPHORE = asyncio.Semaphore(5)
@@ -42,6 +43,7 @@ class TelegramService:
         self.groups_repo = GroupsRepository()
         self.creds_repo = CredentialsRepository()
         self.group_creds_repo = GroupCredentialsRepository()
+        self.media_repo = MediaRepository()  # Repositório de media
 
         self.num_workers = Config.NUM_WORKERS
         self.msg_per_worker = Config.MSG_POR_WORKER
@@ -125,7 +127,7 @@ class TelegramService:
                 except Exception as e:
                     print(f"[W{idx}] ⚠️ Erro processando msg {msg_id}: {e}")
 
-            # ⚡ Ajuste principal: processa sequencialmente
+            # ⚡ Processa sequencialmente
             for m in msg_ids:
                 await process_single(m)
 
@@ -169,7 +171,17 @@ class TelegramService:
             print(f"⚠️ Nenhuma mensagem nova com mídia em {group['title']}")
             return
 
-        msg_ids = [m.id for m in msgs]
+        # ⚡ Filtra mensagens já processadas
+        processed_ids_set = set(
+            self.media_repo.where("group_id", group["id"]).pluck("telegram_message_id")
+        )
+        msg_ids = [m.id for m in msgs if m.id not in processed_ids_set]
+
+        if not msg_ids:
+            print(f"⚠️ Todas as mensagens já foram processadas em {group['title']}")
+            return
+
+        # Divide em chunks para os workers
         chunk_size = self.msg_per_worker
         chunks = [msg_ids[i:i + chunk_size] for i in range(0, len(msg_ids), chunk_size)]
 
