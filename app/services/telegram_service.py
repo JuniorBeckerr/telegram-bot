@@ -130,7 +130,7 @@ class TelegramService:
             # ⚡ Processa sequencialmente
             for m in msg_ids:
                 await process_single(m)
-
+                await asyncio.sleep(2)
             await client.disconnect()
             result_queue.put(last_processed_id)
             elapsed = time.time() - start_time
