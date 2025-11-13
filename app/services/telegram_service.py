@@ -7,7 +7,6 @@ from telethon.errors import FloodWaitError, RPCError
 from app.repository.groups_repository import GroupsRepository
 from app.repository.credentials_repository import CredentialsRepository
 from app.repository.group_credentials_repository import GroupCredentialsRepository
-from app.repository.media_repository import MediaRepository
 from config.settings import Config
 
 TELEGRAM_SEMAPHORE = asyncio.Semaphore(5)
@@ -43,7 +42,6 @@ class TelegramService:
         self.groups_repo = GroupsRepository()
         self.creds_repo = CredentialsRepository()
         self.group_creds_repo = GroupCredentialsRepository()
-        self.media_repo = MediaRepository()  # Repositório de media
 
         self.num_workers = Config.NUM_WORKERS
         self.msg_per_worker = Config.MSG_POR_WORKER
@@ -127,10 +125,10 @@ class TelegramService:
                 except Exception as e:
                     print(f"[W{idx}] ⚠️ Erro processando msg {msg_id}: {e}")
 
-            # ⚡ Processa sequencialmente
+            # ⚡ Ajuste principal: processa sequencialmente
             for m in msg_ids:
                 await process_single(m)
-                await asyncio.sleep(2)
+
             await client.disconnect()
             result_queue.put(last_processed_id)
             elapsed = time.time() - start_time
@@ -171,31 +169,16 @@ class TelegramService:
             print(f"⚠️ Nenhuma mensagem nova com mídia em {group['title']}")
             return
 
-        # ⚡ Filtra mensagens já processadas
-        processed_ids_set = set(
-            self.media_repo.where("group_id", group["id"]).pluck("telegram_message_id")
-        )
-        msg_ids = [m.id for m in msgs if m.id not in processed_ids_set]
-
-        if not msg_ids:
-            print(f"⚠️ Todas as mensagens já foram processadas em {group['title']}")
-            return
-
-        # Divide em chunks para os workers
+        msg_ids = [m.id for m in msgs]
         chunk_size = self.msg_per_worker
         chunks = [msg_ids[i:i + chunk_size] for i in range(0, len(msg_ids), chunk_size)]
 
-        # Decide quantos workers iniciar: até NUM_WORKERS, sem passar do número de sessões ou chunks
-        num_workers_to_start = min(self.num_workers, len(session_files), len(chunks))
-        chunks = chunks[:num_workers_to_start]
-        session_files = session_files[:num_workers_to_start]
-
-        print(f"👷 Iniciando {num_workers_to_start} worker(s)...")
+        print(f"👷 Iniciando {min(len(chunks), len(session_files))} worker(s)...")
         start_time = time.time()
         processes = []
         result_queue = multiprocessing.Queue()
 
-        for i, chunk in enumerate(chunks):
+        for i, chunk in enumerate(chunks[:len(session_files)]):
             p = multiprocessing.Process(
                 target=self._worker_process,
                 args=(i, group, chunk, session_files[i], cred, result_queue)
@@ -206,7 +189,6 @@ class TelegramService:
         for p in processes:
             p.join()
 
-        # Atualiza o last_update_id
         processed_ids = [result_queue.get() for _ in range(result_queue.qsize())]
         if processed_ids:
             last_id = max(processed_ids)
