@@ -185,12 +185,17 @@ class TelegramService:
         chunk_size = self.msg_per_worker
         chunks = [msg_ids[i:i + chunk_size] for i in range(0, len(msg_ids), chunk_size)]
 
-        print(f"👷 Iniciando {min(len(chunks), len(session_files))} worker(s)...")
+        # Decide quantos workers iniciar: até NUM_WORKERS, sem passar do número de sessões ou chunks
+        num_workers_to_start = min(self.num_workers, len(session_files), len(chunks))
+        chunks = chunks[:num_workers_to_start]
+        session_files = session_files[:num_workers_to_start]
+
+        print(f"👷 Iniciando {num_workers_to_start} worker(s)...")
         start_time = time.time()
         processes = []
         result_queue = multiprocessing.Queue()
 
-        for i, chunk in enumerate(chunks[:len(session_files)]):
+        for i, chunk in enumerate(chunks):
             p = multiprocessing.Process(
                 target=self._worker_process,
                 args=(i, group, chunk, session_files[i], cred, result_queue)
@@ -201,6 +206,7 @@ class TelegramService:
         for p in processes:
             p.join()
 
+        # Atualiza o last_update_id
         processed_ids = [result_queue.get() for _ in range(result_queue.qsize())]
         if processed_ids:
             last_id = max(processed_ids)
