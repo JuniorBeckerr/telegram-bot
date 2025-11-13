@@ -1,7 +1,7 @@
 import os
 import asyncio
 import time
-import multiprocessing
+import logging
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError
 from app.repository.groups_repository import GroupsRepository
@@ -10,32 +10,7 @@ from app.repository.group_credentials_repository import GroupCredentialsReposito
 from app.repository.media_repository import MediaRepository
 from config.settings import Config
 
-TELEGRAM_SEMAPHORE = asyncio.Semaphore(5)
-
-
-async def safe_telegram_call(func, *args, retries=3, **kwargs):
-    async with TELEGRAM_SEMAPHORE:
-        for attempt in range(retries):
-            try:
-                return await func(*args, **kwargs)
-            except FloodWaitError as e:
-                print(f"⚠️ FloodWait: aguardando {e.seconds}s antes de tentar novamente...")
-                await asyncio.sleep(e.seconds + 1)
-            except RPCError as e:
-                if "429" in str(e) or "flood" in str(e).lower():
-                    wait_time = 5 * (attempt + 1)
-                    print(f"⚠️ Flood control detectado ({e}). Tentando novamente em {wait_time}s...")
-                    await asyncio.sleep(wait_time)
-                else:
-                    raise
-            except Exception as e:
-                if "429" in str(e) or "flood" in str(e).lower():
-                    wait_time = 5 * (attempt + 1)
-                    print(f"⚠️ Erro 429: aguardando {wait_time}s antes de tentar novamente...")
-                    await asyncio.sleep(wait_time)
-                else:
-                    raise
-        raise Exception(f"❌ Falha após {retries} tentativas em {func.__name__}")
+logger = logging.getLogger(__name__)
 
 
 class TelegramService:
@@ -43,114 +18,91 @@ class TelegramService:
         self.groups_repo = GroupsRepository()
         self.creds_repo = CredentialsRepository()
         self.group_creds_repo = GroupCredentialsRepository()
-        self.media_repo = MediaRepository()  # Repositório de media
+        self.media_repo = MediaRepository()
 
+        # Configurações do settings
         self.num_workers = Config.NUM_WORKERS
         self.msg_per_worker = Config.MSG_POR_WORKER
         self.session_path = Config.SESSION_PATH
 
+        # Delays anti-flood (ajustáveis)
+        self.delay_between_messages = 2.5  # segundos entre cada mensagem
+        self.delay_between_batches = 10    # segundos entre cada batch
+        self.max_retries = 5
+
     async def run_all_groups(self):
+        """Processa todos os grupos habilitados sequencialmente."""
         groups = self.groups_repo.where("enabled", 1).get()
         if not groups:
-            print("⚠️ Nenhum grupo habilitado encontrado.")
+            logger.warning("⚠️ Nenhum grupo habilitado encontrado.")
             return
 
-        for group in groups:
-            await self._dispatch_group(group)
+        logger.info(f"📋 {len(groups)} grupo(s) habilitado(s) encontrado(s).")
 
-    async def _prefetch_valid_messages(self, client, group):
-        total_to_fetch = self.num_workers * self.msg_per_worker * 2
-        last_id = group.get("last_update_id", 0)
-        print(f"📦 Buscando {total_to_fetch} mensagens após ID {last_id} do grupo {group['title']}...")
+        for idx, group in enumerate(groups, 1):
+            logger.info(f"\n{'='*60}")
+            logger.info(f"🎯 [{idx}/{len(groups)}] Processando: {group['title']}")
+            logger.info(f"{'='*60}")
+            await self._process_group(group)
 
-        entity = await safe_telegram_call(client.get_entity, group["id"])
-        msgs = []
-        async for m in client.iter_messages(entity, limit=total_to_fetch, offset_id=last_id, reverse=True):
-            if m.media:
-                msgs.append(m)
+            # Pausa entre grupos para evitar sobrecarga
+            if idx < len(groups):
+                logger.info(f"⏳ Aguardando {self.delay_between_batches}s antes do próximo grupo...")
+                await asyncio.sleep(self.delay_between_batches)
 
-        print(f"✅ {len(msgs)} mensagens válidas encontradas no grupo {group['title']}")
-        return msgs
+    async def _process_group(self, group):
+        """Processa um grupo específico."""
+        start_time = time.time()
 
-    def _worker_process(self, idx, group, msg_ids, session_file, cred, result_queue):
-        async def job():
-            from app.services.pipeline_service import PipelineService
-            pipeline = PipelineService()
-
-            client = TelegramClient(session_file, cred["api_id"], cred["api_hash"])
-            await client.connect()
-
-            if not await client.is_user_authorized():
-                print(f"[W{idx}] ❌ Sessão não autenticada: {session_file}")
-                result_queue.put(0)
-                return
-
-            entity = await client.get_entity(group["id"])
-            start_time = time.time()
-            last_processed_id = 0
-            processed_count = 0
-
-            async def safe_call(func, *args, **kwargs):
-                for attempt in range(5):
-                    try:
-                        return await func(*args, **kwargs)
-                    except FloodWaitError as e:
-                        await asyncio.sleep(e.seconds + 1)
-                    except RPCError as e:
-                        if "disconnected" in str(e).lower() or not client.is_connected():
-                            await client.disconnect()
-                            await asyncio.sleep(3)
-                            await client.connect()
-                        else:
-                            raise
-                    except Exception as e:
-                        if attempt == 4:
-                            print(f"[W{idx}] ❌ Erro persistente: {e}")
-                        else:
-                            await asyncio.sleep(3)
-
-            async def process_single(msg_id):
-                nonlocal last_processed_id, processed_count
-                try:
-                    msg = await safe_call(client.get_messages, entity, ids=msg_id)
-                    if not msg or not msg.media:
-                        return
-
-                    file = await safe_call(msg.download_media, bytes)
-                    if not file:
-                        return
-
-                    mime = msg.file.mime_type or "application/octet-stream"
-                    await pipeline.process_message(msg, file, mime, group, worker_id=idx)
-                    last_processed_id = max(last_processed_id, msg.id)
-                    processed_count += 1
-                except Exception as e:
-                    print(f"[W{idx}] ⚠️ Erro processando msg {msg_id}: {e}")
-
-            # ⚡ Processa sequencialmente
-            for m in msg_ids:
-                await process_single(m)
-                await asyncio.sleep(2)
-            await client.disconnect()
-            result_queue.put(last_processed_id)
-            elapsed = time.time() - start_time
-            print(f"[W{idx}] ✅ Processadas {processed_count}/{len(msg_ids)} mensagens em {elapsed:.2f}s")
-
-        asyncio.run(job())
-
-    async def _dispatch_group(self, group):
+        # Busca credencial vinculada
         link = self.group_creds_repo.where("group_id", group["id"]).first()
         if not link:
-            print(f"⚠️ Nenhuma credencial vinculada ao grupo {group['title']}")
+            logger.warning(f"⚠️ Nenhuma credencial vinculada ao grupo {group['title']}")
             return
 
         cred = self.creds_repo.find(link["credential_id"])
         if not cred or not cred["active"]:
-            print(f"⚠️ Credencial inválida para grupo {group['title']}")
+            logger.warning(f"⚠️ Credencial inválida para grupo {group['title']}")
             return
 
-        # Lista todas as sessões individuais da credencial
+        # Seleciona sessão disponível
+        session_file = self._get_available_session(cred)
+        if not session_file:
+            logger.error(f"❌ Nenhuma sessão disponível para {group['title']}")
+            return
+
+        # Conecta ao Telegram
+        client = TelegramClient(session_file, cred["api_id"], cred["api_hash"])
+
+        try:
+            await client.start(phone=cred["phone"])
+            logger.info(f"✅ Conectado com sessão: {os.path.basename(session_file)}")
+
+            # Busca mensagens não processadas
+            messages_to_process = await self._fetch_unprocessed_messages(client, group)
+
+            if not messages_to_process:
+                logger.info(f"✅ Nenhuma mensagem nova para processar em {group['title']}")
+                return
+
+            # Processa mensagens em batches
+            await self._process_messages_in_batches(client, group, messages_to_process)
+
+        except Exception as e:
+            logger.error(f"❌ Erro ao processar grupo {group['title']}: {e}", exc_info=True)
+        finally:
+            await client.disconnect()
+            elapsed = time.time() - start_time
+            logger.info(f"⏱️ Grupo {group['title']} finalizado em {elapsed:.2f}s")
+
+    def _get_available_session(self, cred):
+        """Retorna a primeira sessão disponível da credencial."""
         cred_dir = os.path.join(self.session_path, str(cred["session_name"]))
+
+        if not os.path.exists(cred_dir):
+            logger.error(f"❌ Diretório de sessões não encontrado: {cred_dir}")
+            return None
+
         session_files = sorted([
             os.path.join(cred_dir, f)
             for f in os.listdir(cred_dir)
@@ -158,54 +110,163 @@ class TelegramService:
         ])
 
         if not session_files:
-            print(f"❌ Nenhuma sessão encontrada em {cred_dir}")
-            return
+            logger.error(f"❌ Nenhuma sessão encontrada em {cred_dir}")
+            return None
 
-        # Prefetch usando a primeira sessão disponível
-        client = TelegramClient(session_files[0], cred["api_id"], cred["api_hash"])
-        await client.start(phone=cred["phone"])
-        msgs = await self._prefetch_valid_messages(client, group)
-        await client.disconnect()
+        # Retorna a primeira sessão (você pode implementar rotação se quiser)
+        return session_files[0]
 
-        if not msgs:
-            print(f"⚠️ Nenhuma mensagem nova com mídia em {group['title']}")
-            return
+    async def _fetch_unprocessed_messages(self, client, group):
+        """Busca mensagens com mídia que ainda não foram processadas."""
+        last_id = group.get("last_update_id", 0)
+        total_to_fetch = self.num_workers * self.msg_per_worker
 
-        # ⚡ Filtra mensagens já processadas
-        processed_ids_set = set(
+        logger.info(f"🔍 Buscando até {total_to_fetch} mensagens após ID {last_id}...")
+
+        # Busca IDs já processados deste grupo
+        processed_ids = set(
             self.media_repo.where("group_id", group["id"]).pluck("telegram_message_id")
         )
-        msg_ids = [m.id for m in msgs if m.id not in processed_ids_set]
+        logger.info(f"📊 {len(processed_ids)} mensagens já processadas anteriormente")
 
-        if not msg_ids:
-            print(f"⚠️ Todas as mensagens já foram processadas em {group['title']}")
-            return
+        # Busca mensagens do Telegram
+        entity = await self._safe_call(client.get_entity, group["id"])
 
-        # Divide em chunks para os workers
-        chunk_size = self.msg_per_worker
-        chunks = [msg_ids[i:i + chunk_size] for i in range(0, len(msg_ids), chunk_size)]
+        unprocessed_messages = []
+        fetched_count = 0
 
-        print(f"👷 Iniciando {min(len(chunks), len(session_files))} worker(s)...")
-        start_time = time.time()
-        processes = []
-        result_queue = multiprocessing.Queue()
+        async for msg in client.iter_messages(
+                entity,
+                limit=total_to_fetch * 2,  # Busca 2x para compensar mensagens já processadas
+                offset_id=last_id,
+                reverse=True
+        ):
+            fetched_count += 1
 
-        for i, chunk in enumerate(chunks[:len(session_files)]):
-            p = multiprocessing.Process(
-                target=self._worker_process,
-                args=(i, group, chunk, session_files[i], cred, result_queue)
-            )
-            p.start()
-            processes.append(p)
+            # Filtra apenas mensagens com mídia não processadas
+            if msg.media and msg.id not in processed_ids:
+                unprocessed_messages.append(msg)
 
-        for p in processes:
-            p.join()
+            # Para quando atingir o limite desejado
+            if len(unprocessed_messages) >= total_to_fetch:
+                break
 
-        processed_ids = [result_queue.get() for _ in range(result_queue.qsize())]
-        if processed_ids:
-            last_id = max(processed_ids)
-            self.groups_repo.update(group["id"], {"last_update_id": last_id})
-            print(f"💾 Atualizado last_update_id={last_id} para {group['title']}")
+        logger.info(f"✅ {len(unprocessed_messages)} mensagens novas encontradas (de {fetched_count} verificadas)")
+        return unprocessed_messages
 
-        elapsed = time.time() - start_time
-        print(f"🏁 Execução finalizada em {elapsed:.2f}s.\n")
+    async def _process_messages_in_batches(self, client, group, messages):
+        """Processa mensagens em batches sequenciais."""
+        from app.services.pipeline_service import PipelineService
+
+        pipeline = PipelineService()
+        total = len(messages)
+        batch_size = self.msg_per_worker
+
+        logger.info(f"🚀 Iniciando processamento de {total} mensagens em batches de {batch_size}")
+
+        processed_count = 0
+        last_processed_id = group.get("last_update_id", 0)
+
+        # Divide em batches
+        for batch_idx in range(0, total, batch_size):
+            batch = messages[batch_idx:batch_idx + batch_size]
+            batch_num = (batch_idx // batch_size) + 1
+            total_batches = (total + batch_size - 1) // batch_size
+
+            logger.info(f"\n📦 Batch {batch_num}/{total_batches} ({len(batch)} mensagens)")
+
+            # Processa cada mensagem do batch sequencialmente
+            for msg_idx, msg in enumerate(batch, 1):
+                try:
+                    logger.info(f"  [{msg_idx}/{len(batch)}] Processando msg ID {msg.id}...")
+
+                    # Download com retry
+                    file_bytes = await self._download_with_retry(client, msg)
+
+                    if not file_bytes:
+                        logger.warning(f"  ⚠️ Não foi possível baixar msg {msg.id}")
+                        continue
+
+                    # Processa através do pipeline
+                    mime = msg.file.mime_type or "application/octet-stream"
+                    await pipeline.process_message(msg, file_bytes, mime, group, worker_id=batch_num)
+
+                    processed_count += 1
+                    last_processed_id = max(last_processed_id, msg.id)
+
+                    # Delay entre mensagens
+                    await asyncio.sleep(self.delay_between_messages)
+
+                except Exception as e:
+                    logger.error(f"  ❌ Erro processando msg {msg.id}: {e}")
+                    continue
+
+            # Salva progresso após cada batch
+            if last_processed_id > group.get("last_update_id", 0):
+                self.groups_repo.update(group["id"], {"last_update_id": last_processed_id})
+                logger.info(f"💾 Progresso salvo: last_update_id={last_processed_id}")
+
+            # Pausa entre batches (exceto no último)
+            if batch_idx + batch_size < total:
+                logger.info(f"⏳ Aguardando {self.delay_between_batches}s antes do próximo batch...")
+                await asyncio.sleep(self.delay_between_batches)
+
+        logger.info(f"\n✅ Processamento concluído: {processed_count}/{total} mensagens")
+
+        # Atualização final
+        if last_processed_id > group.get("last_update_id", 0):
+            self.groups_repo.update(group["id"], {"last_update_id": last_processed_id})
+            logger.info(f"💾 Last_update_id final: {last_processed_id}")
+
+    async def _download_with_retry(self, client, msg):
+        """Baixa mídia com retry e backoff exponencial."""
+        for attempt in range(self.max_retries):
+            try:
+                file_bytes = await self._safe_call(msg.download_media, bytes)
+                return file_bytes
+
+            except FloodWaitError as e:
+                wait_time = e.seconds + 5
+                logger.warning(f"  ⏳ FloodWait: aguardando {wait_time}s...")
+                await asyncio.sleep(wait_time)
+
+            except Exception as e:
+                if attempt < self.max_retries - 1:
+                    wait_time = 2 ** attempt  # backoff exponencial: 1s, 2s, 4s, 8s
+                    logger.warning(f"  ⚠️ Tentativa {attempt + 1}/{self.max_retries} falhou: {e}")
+                    logger.info(f"  ⏳ Aguardando {wait_time}s antes de tentar novamente...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error(f"  ❌ Falha permanente após {self.max_retries} tentativas")
+                    raise
+
+        return None
+
+    async def _safe_call(self, func, *args, **kwargs):
+        """Wrapper para chamadas ao Telegram com retry automático."""
+        for attempt in range(self.max_retries):
+            try:
+                return await func(*args, **kwargs)
+
+            except FloodWaitError as e:
+                wait_time = e.seconds + 2
+                logger.warning(f"⏳ FloodWait detectado: aguardando {wait_time}s...")
+                await asyncio.sleep(wait_time)
+
+            except RPCError as e:
+                if "429" in str(e) or "flood" in str(e).lower():
+                    wait_time = 5 * (attempt + 1)
+                    logger.warning(f"⚠️ Rate limit ({e}). Tentativa {attempt + 1}/{self.max_retries}")
+                    await asyncio.sleep(wait_time)
+                else:
+                    raise
+
+            except Exception as e:
+                if "429" in str(e) or "flood" in str(e).lower():
+                    wait_time = 5 * (attempt + 1)
+                    logger.warning(f"⚠️ Erro 429 detectado. Aguardando {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    raise
+
+        raise Exception(f"❌ Falha após {self.max_retries} tentativas em {func.__name__}")

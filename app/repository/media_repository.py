@@ -8,6 +8,9 @@ class MediaRepository(BaseRepository):
     def find_by_hash(self, sha256_hex: str):
         return self.where("sha256_hex", sha256_hex).first()
 
+    def exists_msg_id(self,group, id):
+        return self.where("group_id", group).where("telegram_message_id", id).first()
+
     def pending_classification(self):
         return self.where("state", "pending_classification").get()
 
