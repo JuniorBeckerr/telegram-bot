@@ -1,9 +1,8 @@
-import os
 import asyncio
 import time
 import logging
-from telethon import TelegramClient
-from telethon.errors import FloodWaitError, RPCError
+from typing import List
+from app.services.session_pool import SessionPool
 from app.repository.groups_repository import GroupsRepository
 from app.repository.credentials_repository import CredentialsRepository
 from app.repository.group_credentials_repository import GroupCredentialsRepository
@@ -20,15 +19,13 @@ class TelegramService:
         self.group_creds_repo = GroupCredentialsRepository()
         self.media_repo = MediaRepository()
 
-        # Configurações do settings
+        # Configurações
         self.num_workers = Config.NUM_WORKERS
         self.msg_per_worker = Config.MSG_POR_WORKER
         self.session_path = Config.SESSION_PATH
 
-        # Delays anti-flood (ajustáveis)
-        self.delay_between_messages = 2.5  # segundos entre cada mensagem
-        self.delay_between_batches = 10    # segundos entre cada batch
-        self.max_retries = 5
+        # Controle de concorrência
+        self.max_concurrent_downloads = 5  # Downloads simultâneos total
 
     async def run_all_groups(self):
         """Processa todos os grupos habilitados sequencialmente."""
@@ -43,15 +40,19 @@ class TelegramService:
             logger.info(f"\n{'='*60}")
             logger.info(f"🎯 [{idx}/{len(groups)}] Processando: {group['title']}")
             logger.info(f"{'='*60}")
-            await self._process_group(group)
 
-            # Pausa entre grupos para evitar sobrecarga
+            try:
+                await self._process_group(group)
+            except Exception as e:
+                logger.error(f"❌ Erro ao processar grupo {group['title']}: {e}", exc_info=True)
+
+            # Pausa entre grupos
             if idx < len(groups):
-                logger.info(f"⏳ Aguardando {self.delay_between_batches}s antes do próximo grupo...")
-                await asyncio.sleep(self.delay_between_batches)
+                logger.info(f"⏳ Aguardando 5s antes do próximo grupo...")
+                await asyncio.sleep(5)
 
     async def _process_group(self, group):
-        """Processa um grupo específico."""
+        """Processa um grupo usando pool de sessões."""
         start_time = time.time()
 
         # Busca credencial vinculada
@@ -65,58 +66,45 @@ class TelegramService:
             logger.warning(f"⚠️ Credencial inválida para grupo {group['title']}")
             return
 
-        # Seleciona sessão disponível
-        session_file = self._get_available_session(cred)
-        if not session_file:
-            logger.error(f"❌ Nenhuma sessão disponível para {group['title']}")
-            return
-
-        # Conecta ao Telegram
-        client = TelegramClient(session_file, cred["api_id"], cred["api_hash"])
+        # Inicializa pool de sessões
+        session_pool = SessionPool(cred, self.session_path)
 
         try:
-            await client.start(phone=cred["phone"])
-            logger.info(f"✅ Conectado com sessão: {os.path.basename(session_file)}")
+            # Conecta todas as sessões
+            if not await session_pool.initialize():
+                logger.error(f"❌ Falha ao inicializar pool de sessões")
+                return
+
+            # Busca entidade do grupo
+            entity = await session_pool.get_entity(group["id"])
+            logger.info(f"✅ Entidade do grupo obtida: {entity.title}")
 
             # Busca mensagens não processadas
-            messages_to_process = await self._fetch_unprocessed_messages(client, group)
+            messages_to_process = await self._fetch_unprocessed_messages(
+                session_pool, entity, group
+            )
 
             if not messages_to_process:
                 logger.info(f"✅ Nenhuma mensagem nova para processar em {group['title']}")
                 return
 
-            # Processa mensagens em batches
-            await self._process_messages_in_batches(client, group, messages_to_process)
+            # Limita ao total esperado (NUM_WORKERS × MSG_POR_WORKER)
+            total_expected = self.num_workers * self.msg_per_worker
+            if len(messages_to_process) > total_expected:
+                logger.info(f"📊 Limitando processamento a {total_expected} mensagens")
+                messages_to_process = messages_to_process[:total_expected]
 
-        except Exception as e:
-            logger.error(f"❌ Erro ao processar grupo {group['title']}: {e}", exc_info=True)
+            # Processa mensagens em paralelo com workers
+            await self._process_messages_parallel(
+                session_pool, group, messages_to_process
+            )
+
         finally:
-            await client.disconnect()
+            await session_pool.close_all()
             elapsed = time.time() - start_time
             logger.info(f"⏱️ Grupo {group['title']} finalizado em {elapsed:.2f}s")
 
-    def _get_available_session(self, cred):
-        """Retorna a primeira sessão disponível da credencial."""
-        cred_dir = os.path.join(self.session_path, str(cred["session_name"]))
-
-        if not os.path.exists(cred_dir):
-            logger.error(f"❌ Diretório de sessões não encontrado: {cred_dir}")
-            return None
-
-        session_files = sorted([
-            os.path.join(cred_dir, f)
-            for f in os.listdir(cred_dir)
-            if f.endswith(".session")
-        ])
-
-        if not session_files:
-            logger.error(f"❌ Nenhuma sessão encontrada em {cred_dir}")
-            return None
-
-        # Retorna a primeira sessão (você pode implementar rotação se quiser)
-        return session_files[0]
-
-    async def _fetch_unprocessed_messages(self, client, group):
+    async def _fetch_unprocessed_messages(self, session_pool, entity, group):
         """Busca mensagens com mídia que ainda não foram processadas."""
         last_id = group.get("last_update_id", 0)
         total_to_fetch = self.num_workers * self.msg_per_worker
@@ -129,144 +117,171 @@ class TelegramService:
         )
         logger.info(f"📊 {len(processed_ids)} mensagens já processadas anteriormente")
 
-        # Busca mensagens do Telegram
-        entity = await self._safe_call(client.get_entity, group["id"])
-
+        # Busca mensagens em lotes usando o pool
         unprocessed_messages = []
-        fetched_count = 0
+        batch_size = 100
+        offset_id = last_id
 
-        async for msg in client.iter_messages(
-                entity,
-                limit=total_to_fetch * 2,  # Busca 2x para compensar mensagens já processadas
-                offset_id=last_id,
-                reverse=True
-        ):
-            fetched_count += 1
+        while len(unprocessed_messages) < total_to_fetch:
+            try:
+                # Busca batch de mensagens
+                messages_batch = await session_pool.iter_messages_batch(
+                    entity,
+                    limit=batch_size,
+                    offset_id=offset_id
+                )
 
-            # Filtra apenas mensagens com mídia não processadas
-            if msg.media and msg.id not in processed_ids:
-                unprocessed_messages.append(msg)
+                if not messages_batch:
+                    logger.info("📭 Não há mais mensagens para buscar")
+                    break
 
-            # Para quando atingir o limite desejado
-            if len(unprocessed_messages) >= total_to_fetch:
+                # Filtra mensagens com mídia não processadas
+                for msg in messages_batch:
+                    if msg.media and msg.id not in processed_ids:
+                        unprocessed_messages.append(msg)
+
+                        if len(unprocessed_messages) >= total_to_fetch:
+                            break
+
+                # Atualiza offset para próximo batch
+                offset_id = messages_batch[-1].id
+
+                logger.info(
+                    f"  📦 Batch processado: {len(unprocessed_messages)}/{total_to_fetch} "
+                    f"encontradas (último ID: {offset_id})"
+                )
+
+                # Para se já encontrou o suficiente
+                if len(unprocessed_messages) >= total_to_fetch:
+                    break
+
+                # Pequeno delay entre batches de busca
+                await asyncio.sleep(1)
+
+            except Exception as e:
+                logger.error(f"❌ Erro ao buscar mensagens: {e}")
                 break
 
-        logger.info(f"✅ {len(unprocessed_messages)} mensagens novas encontradas (de {fetched_count} verificadas)")
+        logger.info(
+            f"✅ {len(unprocessed_messages)} mensagens novas encontradas para processar"
+        )
         return unprocessed_messages
 
-    async def _process_messages_in_batches(self, client, group, messages):
-        """Processa mensagens em batches sequenciais."""
+    async def _process_messages_parallel(self, session_pool, group, messages: List):
+        """Processa mensagens em paralelo com workers."""
+        from app.services.pipeline_service import PipelineService
+
+        total = len(messages)
+        logger.info(f"🚀 Processando {total} mensagens com {self.num_workers} workers")
+
+        # Divide mensagens em chunks por worker
+        chunks = self._split_into_chunks(messages, self.num_workers)
+
+        # Mostra status do pool
+        pool_status = session_pool.get_pool_status()
+        logger.info(
+            f"📊 Pool: {pool_status['available']}/{pool_status['total']} sessões disponíveis"
+        )
+
+        # Processa cada worker em paralelo
+        tasks = []
+        for worker_id, chunk in enumerate(chunks, 1):
+            if not chunk:
+                continue
+
+            task = asyncio.create_task(
+                self._process_worker_chunk(
+                    session_pool=session_pool,
+                    worker_id=worker_id,
+                    messages=chunk,
+                    group=group,
+                    total_workers=self.num_workers
+                )
+            )
+            tasks.append(task)
+
+        # Aguarda todos os workers terminarem
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Conta sucessos e falhas
+        total_processed = sum(r for r in results if isinstance(r, int))
+        total_failed = sum(1 for r in results if isinstance(r, Exception))
+
+        logger.info(f"\n{'='*60}")
+        logger.info(f"✅ Processamento concluído:")
+        logger.info(f"  📊 Processadas: {total_processed}/{total}")
+        logger.info(f"  ❌ Falhas: {total_failed}")
+
+        # Mostra estatísticas finais do pool
+        final_status = session_pool.get_pool_status()
+        logger.info(f"  🔄 Total de requisições: {final_status['total_requests']}")
+        logger.info(f"{'='*60}")
+
+        # Atualiza last_update_id para o maior ID processado
+        if messages:
+            max_id = max(msg.id for msg in messages)
+            if max_id > group.get("last_update_id", 0):
+                self.groups_repo.update(group["id"], {"last_update_id": max_id})
+                logger.info(f"💾 Last_update_id atualizado: {max_id}")
+
+    async def _process_worker_chunk(
+            self,
+            session_pool: SessionPool,
+            worker_id: int,
+            messages: List,
+            group: dict,
+            total_workers: int
+    ) -> int:
+        """Processa um chunk de mensagens em um worker."""
         from app.services.pipeline_service import PipelineService
 
         pipeline = PipelineService()
-        total = len(messages)
-        batch_size = self.msg_per_worker
+        processed = 0
+        chunk_size = len(messages)
 
-        logger.info(f"🚀 Iniciando processamento de {total} mensagens em batches de {batch_size}")
+        logger.info(f"👷 Worker {worker_id}/{total_workers}: {chunk_size} mensagens")
 
-        processed_count = 0
-        last_processed_id = group.get("last_update_id", 0)
+        for idx, msg in enumerate(messages, 1):
+            try:
+                logger.info(
+                    f"  [{worker_id}] [{idx}/{chunk_size}] Processando msg ID {msg.id}..."
+                )
 
-        # Divide em batches
-        for batch_idx in range(0, total, batch_size):
-            batch = messages[batch_idx:batch_idx + batch_size]
-            batch_num = (batch_idx // batch_size) + 1
-            total_batches = (total + batch_size - 1) // batch_size
+                # Download usando pool (rotação automática de sessões)
+                file_bytes = await session_pool.download_media(msg)
 
-            logger.info(f"\n📦 Batch {batch_num}/{total_batches} ({len(batch)} mensagens)")
-
-            # Processa cada mensagem do batch sequencialmente
-            for msg_idx, msg in enumerate(batch, 1):
-                try:
-                    logger.info(f"  [{msg_idx}/{len(batch)}] Processando msg ID {msg.id}...")
-
-                    # Download com retry
-                    file_bytes = await self._download_with_retry(client, msg)
-
-                    if not file_bytes:
-                        logger.warning(f"  ⚠️ Não foi possível baixar msg {msg.id}")
-                        continue
-
-                    # Processa através do pipeline
-                    mime = msg.file.mime_type or "application/octet-stream"
-                    await pipeline.process_message(msg, file_bytes, mime, group, worker_id=batch_num)
-
-                    processed_count += 1
-                    last_processed_id = max(last_processed_id, msg.id)
-
-                    # Delay entre mensagens
-                    await asyncio.sleep(self.delay_between_messages)
-
-                except Exception as e:
-                    logger.error(f"  ❌ Erro processando msg {msg.id}: {e}")
+                if not file_bytes:
+                    logger.warning(f"  [{worker_id}] ⚠️ Falha no download msg {msg.id}")
                     continue
 
-            # Salva progresso após cada batch
-            if last_processed_id > group.get("last_update_id", 0):
-                self.groups_repo.update(group["id"], {"last_update_id": last_processed_id})
-                logger.info(f"💾 Progresso salvo: last_update_id={last_processed_id}")
+                # Processa através do pipeline
+                mime = msg.file.mime_type or "application/octet-stream"
+                await pipeline.process_message(msg, file_bytes, mime, group, worker_id)
 
-            # Pausa entre batches (exceto no último)
-            if batch_idx + batch_size < total:
-                logger.info(f"⏳ Aguardando {self.delay_between_batches}s antes do próximo batch...")
-                await asyncio.sleep(self.delay_between_batches)
+                processed += 1
 
-        logger.info(f"\n✅ Processamento concluído: {processed_count}/{total} mensagens")
-
-        # Atualização final
-        if last_processed_id > group.get("last_update_id", 0):
-            self.groups_repo.update(group["id"], {"last_update_id": last_processed_id})
-            logger.info(f"💾 Last_update_id final: {last_processed_id}")
-
-    async def _download_with_retry(self, client, msg):
-        """Baixa mídia com retry e backoff exponencial."""
-        for attempt in range(self.max_retries):
-            try:
-                file_bytes = await self._safe_call(msg.download_media, bytes)
-                return file_bytes
-
-            except FloodWaitError as e:
-                wait_time = e.seconds + 5
-                logger.warning(f"  ⏳ FloodWait: aguardando {wait_time}s...")
-                await asyncio.sleep(wait_time)
+                # Pequeno delay entre mensagens do mesmo worker
+                await asyncio.sleep(0.5)
 
             except Exception as e:
-                if attempt < self.max_retries - 1:
-                    wait_time = 2 ** attempt  # backoff exponencial: 1s, 2s, 4s, 8s
-                    logger.warning(f"  ⚠️ Tentativa {attempt + 1}/{self.max_retries} falhou: {e}")
-                    logger.info(f"  ⏳ Aguardando {wait_time}s antes de tentar novamente...")
-                    await asyncio.sleep(wait_time)
-                else:
-                    logger.error(f"  ❌ Falha permanente após {self.max_retries} tentativas")
-                    raise
+                logger.error(f"  [{worker_id}] ❌ Erro msg {msg.id}: {e}")
+                continue
 
-        return None
+        logger.info(f"✅ Worker {worker_id} finalizado: {processed}/{chunk_size} processadas")
+        return processed
 
-    async def _safe_call(self, func, *args, **kwargs):
-        """Wrapper para chamadas ao Telegram com retry automático."""
-        for attempt in range(self.max_retries):
-            try:
-                return await func(*args, **kwargs)
+    def _split_into_chunks(self, items: List, num_chunks: int) -> List[List]:
+        """Divide lista em N chunks equilibrados."""
+        chunk_size = len(items) // num_chunks
+        remainder = len(items) % num_chunks
 
-            except FloodWaitError as e:
-                wait_time = e.seconds + 2
-                logger.warning(f"⏳ FloodWait detectado: aguardando {wait_time}s...")
-                await asyncio.sleep(wait_time)
+        chunks = []
+        start = 0
 
-            except RPCError as e:
-                if "429" in str(e) or "flood" in str(e).lower():
-                    wait_time = 5 * (attempt + 1)
-                    logger.warning(f"⚠️ Rate limit ({e}). Tentativa {attempt + 1}/{self.max_retries}")
-                    await asyncio.sleep(wait_time)
-                else:
-                    raise
+        for i in range(num_chunks):
+            # Distribui o resto entre os primeiros chunks
+            end = start + chunk_size + (1 if i < remainder else 0)
+            chunks.append(items[start:end])
+            start = end
 
-            except Exception as e:
-                if "429" in str(e) or "flood" in str(e).lower():
-                    wait_time = 5 * (attempt + 1)
-                    logger.warning(f"⚠️ Erro 429 detectado. Aguardando {wait_time}s...")
-                    await asyncio.sleep(wait_time)
-                else:
-                    raise
-
-        raise Exception(f"❌ Falha após {self.max_retries} tentativas em {func.__name__}")
+        return chunks
