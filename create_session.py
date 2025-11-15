@@ -4,7 +4,7 @@ from telethon import TelegramClient
 from config.settings import Config
 from app.repository.credentials_repository import CredentialsRepository
 
-async def create_multiple_sessions(credential_id, num_sessions=5):
+async def create_multiple_sessions(credential_id, num_sessions=3):
     repo = CredentialsRepository()
     credential = repo.find(credential_id)
 

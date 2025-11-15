@@ -34,10 +34,10 @@ class SessionInfo:
         if self.flood_wait_until > now:
             return self.flood_wait_until - now
 
-        # Cooldown BALANCEADO: 0.8s (não muito alto, não muito baixo)
+        # COOLDOWN REAL: 2s entre requests da mesma sessão
         time_since_last = now - self.last_request_time
-        if time_since_last < 0.8:
-            return 0.8 - time_since_last
+        if time_since_last < 2.0:
+            return 2.0 - time_since_last
         return 0
 
     def mark_request(self):
@@ -45,8 +45,8 @@ class SessionInfo:
         self.requests_count += 1
 
     def mark_flood_wait(self, seconds: int):
-        self.flood_wait_until = time.time() + seconds + 3
-        logger.warning(f"  🔴 Sessão {self.index} em FloodWait por {seconds}s")
+        self.flood_wait_until = time.time() + seconds + 5
+        logger.warning(f"  🔴 Sessão {self.index} FloodWait {seconds}s")
 
     def mark_error(self):
         self.consecutive_errors += 1
@@ -55,8 +55,8 @@ class SessionInfo:
         self.consecutive_errors = 0
 
 
-class SessionPoolBalanced:
-    """Pool de sessões BALANCEADO - evita FloodWait sem ser lento"""
+class SessionPoolProduction:
+    """Pool PRODUCTION - funciona 24/7 sem travar"""
 
     def __init__(self, credential: dict, session_path: str):
         self.credential = credential
@@ -64,10 +64,14 @@ class SessionPoolBalanced:
         self.sessions: List[SessionInfo] = []
         self.session_queue: deque = deque()
         self.lock = asyncio.Lock()
+        self.global_last_download = 0
 
-        # CONFIGURAÇÃO BALANCEADA
-        self.max_concurrent_per_session = 3  # 3 downloads por sessão (balanceado)
-        self.download_semaphores: Dict[int, asyncio.Semaphore] = {}
+        # CONFIGURAÇÃO PRODUCTION: 1 download por vez
+        self.max_concurrent = 1
+        self.global_semaphore = asyncio.Semaphore(1)
+
+        # DELAY ENTRE DOWNLOADS: 2s mínimo
+        self.min_delay_between_downloads = 2.0
 
     async def initialize(self) -> bool:
         cred_dir = os.path.join(self.session_path, str(self.credential["session_name"]))
@@ -86,28 +90,20 @@ class SessionPoolBalanced:
             logger.error(f"❌ Nenhuma sessão encontrada")
             return False
 
-        logger.info(f"🔧 Inicializando {len(session_files)} sessões (modo BALANCEADO)...")
+        logger.info(f"🔧 Inicializando {len(session_files)} sessões (PRODUCTION)...")
 
-        # Conecta sessões em paralelo
-        tasks = []
+        # Conecta sequencialmente
         for idx, session_file in enumerate(session_files):
-            tasks.append(self._connect_session(idx, session_file))
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for result in results:
-            if isinstance(result, SessionInfo):
+            result = await self._connect_session(idx, session_file)
+            if result:
                 self.sessions.append(result)
                 self.session_queue.append(result)
-                self.download_semaphores[result.index] = asyncio.Semaphore(
-                    self.max_concurrent_per_session
-                )
 
         if not self.sessions:
             logger.error("❌ Nenhuma sessão conectada")
             return False
 
-        logger.info(f"✅ Pool com {len(self.sessions)} sessões | {self.max_concurrent_per_session} downloads/sessão")
+        logger.info(f"✅ Pool PRODUCTION: {len(self.sessions)} sessões | 1 download por vez | 2s entre downloads")
         return True
 
     async def _connect_session(self, idx: int, session_file: str) -> Optional[SessionInfo]:
@@ -123,14 +119,14 @@ class SessionPoolBalanced:
             session_info = SessionInfo(client, session_file, idx)
             session_info.is_connected = True
 
-            logger.info(f"  ✅ Sessão {idx}: {os.path.basename(session_file)}")
+            logger.info(f"  ✅ Sessão {idx}")
             return session_info
 
         except Exception as e:
             logger.error(f"  ❌ Sessão {idx}: {e}")
             return None
 
-    async def get_next_session(self, max_wait: float = 15.0) -> Optional[SessionInfo]:
+    async def get_next_session(self, max_wait: float = 20.0) -> Optional[SessionInfo]:
         start_time = time.time()
 
         while time.time() - start_time < max_wait:
@@ -145,59 +141,66 @@ class SessionPoolBalanced:
                             await asyncio.sleep(cooldown)
                         return session
 
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.3)
 
         return None
 
     async def download_media(self, message):
-        """Download com retry e controle de FloodWait"""
-        for attempt in range(2):
-            session = await self.get_next_session()
+        """Download com ESPERA GLOBAL entre cada request"""
+        async with self.global_semaphore:
+            # Garante 2s entre QUALQUER download
+            now = time.time()
+            time_since_last = now - self.global_last_download
+            if time_since_last < self.min_delay_between_downloads:
+                wait = self.min_delay_between_downloads - time_since_last
+                await asyncio.sleep(wait)
 
-            if not session:
-                if attempt < 1:
-                    await asyncio.sleep(3)
-                    continue
-                raise Exception("Nenhuma sessão disponível")
+            for attempt in range(2):
+                session = await self.get_next_session()
 
-            try:
-                async with self.download_semaphores[session.index]:
+                if not session:
+                    if attempt < 1:
+                        await asyncio.sleep(5)
+                        continue
+                    raise Exception("Nenhuma sessão disponível")
+
+                try:
                     session.mark_request()
                     result = await message.download_media(file=bytes)
                     session.reset_errors()
+                    self.global_last_download = time.time()
                     return result
 
-            except FloodWaitError as e:
-                session.mark_flood_wait(e.seconds)
-                if attempt < 1:
-                    await asyncio.sleep(1)
-                    continue
-                raise
+                except FloodWaitError as e:
+                    session.mark_flood_wait(e.seconds)
+                    logger.warning(f"  ⏳ Aguardando FloodWait: {e.seconds}s")
+                    await asyncio.sleep(e.seconds + 3)
+                    if attempt < 1:
+                        continue
+                    raise
 
-            except Exception as e:
-                session.mark_error()
-                if attempt < 1:
-                    await asyncio.sleep(1)
-                    continue
-                raise
+                except Exception as e:
+                    session.mark_error()
+                    if attempt < 1:
+                        await asyncio.sleep(2)
+                        continue
+                    raise
 
-        raise Exception("Falha após tentativas")
+            raise Exception("Falha após tentativas")
 
     async def get_entity(self, entity_id):
-        async def _get_entity(client, eid):
-            return await client.get_entity(eid)
-
         session = await self.get_next_session()
         if not session:
             raise Exception("Nenhuma sessão disponível")
 
         try:
             session.mark_request()
-            result = await _get_entity(session.client, entity_id)
+            result = await session.client.get_entity(entity_id)
             session.reset_errors()
             return result
         except FloodWaitError as e:
             session.mark_flood_wait(e.seconds)
+            await asyncio.sleep(e.seconds + 3)
             raise
 
     async def iter_messages_batch(self, entity, limit: int, offset_id: int = 0):
@@ -217,9 +220,9 @@ class SessionPoolBalanced:
             ):
                 messages.append(msg)
 
-                # Pausa suave a cada 100 mensagens
-                if len(messages) % 100 == 0:
-                    await asyncio.sleep(0.5)
+                # Pausa a cada 50
+                if len(messages) % 50 == 0:
+                    await asyncio.sleep(1)
 
             session.reset_errors()
             return messages
@@ -233,8 +236,11 @@ class SessionPoolBalanced:
 
     async def close_all(self):
         logger.info("🔌 Fechando sessões...")
-        tasks = [s.client.disconnect() for s in self.sessions]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        for s in self.sessions:
+            try:
+                await s.client.disconnect()
+            except:
+                pass
 
     def get_pool_status(self) -> dict:
         available = sum(1 for s in self.sessions if s.is_available())
