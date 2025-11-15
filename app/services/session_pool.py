@@ -31,15 +31,19 @@ class SessionInfo:
 
     def get_cooldown(self) -> float:
         now = time.time()
+
+        # PRIORIDADE: FloodWait tem precedência
         if self.flood_wait_until > now:
             return self.flood_wait_until - now
 
-        # Cooldown BALANCEADO: 0.8s (não muito alto, não muito baixo)
+        # Cooldown entre requisições: 1.2s (mais conservador)
         time_since_last = now - self.last_request_time
-        if time_since_last < 0.8:
-            return 0.8 - time_since_last
-        return 0
+        required_cooldown = 1.2
 
+        if time_since_last < required_cooldown:
+            return required_cooldown - time_since_last
+
+        return 0
     def mark_request(self):
         self.last_request_time = time.time()
         self.requests_count += 1
@@ -150,38 +154,57 @@ class SessionPoolBalanced:
         return None
 
     async def download_media(self, message):
-        """Download com retry e controle de FloodWait"""
-        for attempt in range(2):
-            session = await self.get_next_session()
+        """Download com retry e controle de FloodWait CORRIGIDO"""
+        max_attempts = 3
+        base_delay = 2
+
+        for attempt in range(max_attempts):
+            session = await self.get_next_session(max_wait=30.0)  # Aumenta timeout
 
             if not session:
-                if attempt < 1:
-                    await asyncio.sleep(3)
+                logger.warning(f"⚠️ Tentativa {attempt+1}/{max_attempts}: Nenhuma sessão disponível")
+                if attempt < max_attempts - 1:
+                    wait_time = base_delay * (2 ** attempt)  # Backoff exponencial
+                    await asyncio.sleep(wait_time)
                     continue
-                raise Exception("Nenhuma sessão disponível")
+                raise Exception("Nenhuma sessão disponível após todas as tentativas")
 
             try:
                 async with self.download_semaphores[session.index]:
+                    # CRÍTICO: Verifica FloodWait ANTES de usar a sessão
+                    flood_cooldown = session.get_cooldown()
+                    if flood_cooldown > 0:
+                        logger.info(f"⏳ Aguardando {flood_cooldown:.1f}s (FloodWait da sessão {session.index})")
+                        await asyncio.sleep(flood_cooldown)
+
                     session.mark_request()
                     result = await message.download_media(file=bytes)
                     session.reset_errors()
                     return result
 
             except FloodWaitError as e:
-                session.mark_flood_wait(e.seconds)
-                if attempt < 1:
-                    await asyncio.sleep(1)
+                wait_seconds = e.seconds + 2  # Adiciona margem de segurança
+                logger.warning(f"🔴 FloodWait: {wait_seconds}s na sessão {session.index}")
+                session.mark_flood_wait(wait_seconds)
+
+                if attempt < max_attempts - 1:
+                    # Aguarda o tempo completo do FloodWait
+                    logger.info(f"⏸️ Aguardando {wait_seconds}s antes de nova tentativa...")
+                    await asyncio.sleep(wait_seconds)
                     continue
                 raise
 
             except Exception as e:
                 session.mark_error()
-                if attempt < 1:
-                    await asyncio.sleep(1)
+                logger.error(f"❌ Erro na sessão {session.index}: {e}")
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(base_delay)
                     continue
                 raise
 
-        raise Exception("Falha após tentativas")
+        raise Exception(f"Falha após {max_attempts} tentativas")\
+
+
 
     async def get_entity(self, entity_id):
         async def _get_entity(client, eid):
