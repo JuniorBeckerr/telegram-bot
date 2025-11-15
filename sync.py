@@ -2,9 +2,7 @@ import asyncio
 import time
 import logging
 from datetime import datetime
-from app.services.now.tdlib_telegram_service import TDLibTelegramService
-import os
-os.environ["TD_JSON_LIBRARY"] = "/opt/homebrew/lib/libtdjson.dylib"
+from app.services.telegram_service import TelegramServiceBalanced
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 async def run_batch():
     """Executa um batch de processamento"""
-    service = TDLibTelegramService()
+    service = TelegramServiceBalanced()
     await service.run_all_groups()
 
 
