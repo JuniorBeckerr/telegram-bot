@@ -45,7 +45,7 @@ class ConfigSingleton:
 
         # --- CONFIGURAÇÕES DE PROCESSAMENTO ---
         self.NUM_WORKERS = 1          # número de processos simultâneos
-        self.MSG_POR_WORKER = 250       # quantas mensagens cada worker processa
+        self.MSG_POR_WORKER = 2500       # quantas mensagens cada worker processa
         self.RETRIES = 3              # número de tentativas em caso de erro
         self.OFFSET_INICIAL = 0      # deslocamento inicial de mensagens no Telegram
 
