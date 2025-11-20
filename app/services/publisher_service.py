@@ -422,26 +422,41 @@ class PublisherServiceV3:
 
         logger.info(f"📊 {len(items_by_model)} modelos para processar")
 
-        # Busca bot do grupo
-        group_bot = self.group_bots_repo.get_publisher_bot(group_id)
-        if not group_bot:
-            logger.error(f"❌ Nenhum bot para grupo {group_id}")
+        # Busca TODOS os bots do grupo para rotação
+        group_bots = self.group_bots_repo.get_publisher_bots(group_id)
+        if not group_bots:
+            # Fallback para método antigo
+            group_bot = self.group_bots_repo.get_publisher_bot(group_id)
+            if group_bot:
+                group_bots = [group_bot]
+            else:
+                logger.error(f"❌ Nenhum bot para grupo {group_id}")
+                return
+
+        # Carrega todos os bot services
+        bot_services = []
+        for gb in group_bots:
+            bot_id = gb["bot_id"]
+            bot_service = await self._get_bot_service(bot_id)
+            if bot_service:
+                bot_services.append((bot_id, bot_service))
+
+        if not bot_services:
+            logger.error(f"❌ Nenhum bot disponível para grupo {group_id}")
             return
 
-        bot_id = group_bot["bot_id"]
-        bot_service = await self._get_bot_service(bot_id)
-        if not bot_service:
-            logger.error(f"❌ Bot {bot_id} não disponível")
-            return
+        logger.info(f"🤖 {len(bot_services)} bots disponíveis para rotação")
 
         # Prepara tasks para cada modelo
         model_ids = list(items_by_model.keys())
         random.shuffle(model_ids)
 
-        # Processa modelos em paralelo
+        # Processa modelos em paralelo, distribuindo entre os bots
         results = await asyncio.gather(*[
             self._process_single_model(
-                bot_service, bot_id, group_id,
+                bot_services[i % len(bot_services)][1],  # Rotaciona bots
+                bot_services[i % len(bot_services)][0],  # bot_id
+                group_id,
                 items_by_model[mid][:batch_size],
                 model_info[mid],
                 model_index=i

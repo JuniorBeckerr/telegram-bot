@@ -37,3 +37,16 @@ class GroupBotsRepository(BaseRepository):
         return (self.where("group_id", group_id)
                 .where("bot_id", bot_id)
                 .delete())
+
+    def get_publisher_bots(self, group_id: int):
+        """
+        Retorna TODOS os bots publishers de um grupo para rotação.
+
+        Args:
+            group_id: ID do grupo
+
+        Returns:
+            Lista de bots publishers ativos
+        """
+        return self.where("group_id", group_id).where("is_publisher", 1).get()
+
