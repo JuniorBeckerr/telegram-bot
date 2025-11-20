@@ -20,7 +20,8 @@ class BotServiceV2:
     """
 
     # Servidor local (sem limite de tamanho)
-    BASE_URL = "http://154.38.174.118:9000/bot{token}/{method}"
+    BASE_URL = "https://api.telegram.org/bot{token}/{method}"
+    # BASE_URL = "http://154.38.174.118:9000/bot{token}/{method}"
 
     def __init__(self, token: str, timeout: int = 120, base_url: str = None):
         self.token = token
