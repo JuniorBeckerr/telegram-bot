@@ -745,6 +745,26 @@ class QueryBuilder:
         logger.debug(f"Params: {self.params}")
         return self
 
+    def where_column(self, field1, field2, operator='='):
+        """Compara coluna com coluna (ex: attempts < max_attempts)"""
+        self.conditions.append(f"{field1} {operator} {field2}")
+        return self
+
+    def whereColumn(self, field1, field2, operator='='):
+        return self.where_column(field1, field2, operator)
+
+    def or_where_column(self, field1, field2, operator='='):
+        """OR comparando coluna com coluna"""
+        if not self.conditions:
+            return self.where_column(field1, field2, operator)
+
+        existing = " AND ".join(f"({c})" for c in self.conditions)
+        self.conditions = [f"({existing}) OR {field1} {operator} {field2}"]
+        return self
+
+    def orWhereColumn(self, field1, field2, operator='='):
+        return self.or_where_column(field1, field2, operator)
+
 
 class BaseRepository:
     def __init__(self, table_name, primary_key='id'):
