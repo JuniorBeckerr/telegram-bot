@@ -1,6 +1,6 @@
 """
-Publisher Service V2 - Com Download Workers e Upload via FormData
-100% de acertividade usando FormData para envio de mídias
+Publisher Service V3 - Máxima Performance com Workers Paralelos por Modelo
+Otimizado para servidores com múltiplos cores e RAM
 """
 import asyncio
 import aiohttp
@@ -14,6 +14,7 @@ from datetime import datetime
 from collections import defaultdict
 from pathlib import Path
 import random
+from concurrent.futures import ThreadPoolExecutor
 
 from app.repository.models_repository import ModelsRepository
 from app.services.bot_service import BotServiceV2, BotApiError
@@ -42,17 +43,6 @@ class DownloadWorker:
         self.failed = 0
 
     async def download(self, url: str, dest_path: str, timeout: int = 120) -> bool:
-        """
-        Baixa um arquivo da URL para o caminho de destino.
-
-        Args:
-            url: URL do arquivo
-            dest_path: Caminho local para salvar
-            timeout: Timeout em segundos
-
-        Returns:
-            True se sucesso, False se falha
-        """
         try:
             timeout_config = aiohttp.ClientTimeout(total=timeout)
 
@@ -62,16 +52,13 @@ class DownloadWorker:
                     self.failed += 1
                     return False
 
-                # Cria diretório se não existir
                 Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
 
-                # Baixa em chunks para não estourar memória
                 with open(dest_path, 'wb') as f:
-                    async for chunk in response.content.iter_chunked(8192):
+                    async for chunk in response.content.iter_chunked(65536):  # 64KB chunks
                         f.write(chunk)
 
                 self.downloaded += 1
-                logger.debug(f"Worker {self.worker_id}: Download OK - {dest_path}")
                 return True
 
         except asyncio.TimeoutError:
@@ -87,15 +74,18 @@ class DownloadWorker:
 class DownloadManager:
     """Gerencia pool de workers para download paralelo"""
 
-    def __init__(self, num_workers: int = 5, timeout: int = 120):
+    def __init__(self, num_workers: int = 10, timeout: int = 120):
         self.num_workers = num_workers
         self.timeout = timeout
         self._session: Optional[aiohttp.ClientSession] = None
-        self._workers: List[DownloadWorker] = []
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            connector = aiohttp.TCPConnector(limit=self.num_workers * 2)
+            connector = aiohttp.TCPConnector(
+                limit=self.num_workers * 3,
+                limit_per_host=self.num_workers * 2,
+                ttl_dns_cache=300
+            )
             self._session = aiohttp.ClientSession(connector=connector)
         return self._session
 
@@ -104,32 +94,16 @@ class DownloadManager:
             await self._session.close()
 
     async def download_batch(self, items: List[Dict]) -> List[Dict]:
-        """
-        Baixa um batch de itens em paralelo usando workers.
-
-        Args:
-            items: Lista de dicts com:
-                   - url: URL do arquivo
-                   - dest_path: Caminho de destino
-                   - (outros campos são preservados)
-
-        Returns:
-            Lista de items com campo 'downloaded' (True/False) adicionado
-        """
         if not items:
             return []
 
         session = await self._get_session()
-
-        # Cria workers
         workers = [DownloadWorker(i, session) for i in range(self.num_workers)]
 
-        # Fila de trabalho
         queue = asyncio.Queue()
         for item in items:
             await queue.put(item)
 
-        # Resultados
         results = []
         results_lock = asyncio.Lock()
 
@@ -153,25 +127,32 @@ class DownloadManager:
 
                 queue.task_done()
 
-        # Executa workers em paralelo
         tasks = [worker_task(w) for w in workers]
         await asyncio.gather(*tasks)
 
-        # Log estatísticas
         total_ok = sum(1 for r in results if r.get("downloaded"))
         total_fail = len(results) - total_ok
-        logger.info(f"📥 Download batch: {total_ok} OK, {total_fail} falhas")
+        logger.debug(f"📥 Download: {total_ok} OK, {total_fail} falhas")
 
         return results
 
 
-class PublisherServiceV2:
+class PublisherServiceV3:
     """
-    Serviço de publicação com download workers e upload via FormData.
-    Garante 100% de acertividade usando arquivos locais.
+    Serviço de publicação com máxima performance.
+    Processa múltiplos modelos em paralelo.
     """
 
-    def __init__(self, download_workers: int = 5):
+    def __init__(self,
+                 download_workers: int = 12,
+                 model_workers: int = 4,
+                 thumb_workers: int = 6):
+        """
+        Args:
+            download_workers: Workers para download (recomendado: 10-15)
+            model_workers: Modelos processados em paralelo (recomendado: 3-6)
+            thumb_workers: Threads para extração de thumbnails (recomendado: 4-8)
+        """
         # Repositories
         self.groups_repo = GroupsRepository()
         self.bots_repo = BotsRepository()
@@ -187,29 +168,39 @@ class PublisherServiceV2:
 
         # Configurações
         self.batch_size = getattr(Config, 'PUBLISHER_BATCH_SIZE', 6)
-        self.min_interval = getattr(Config, 'PUBLISHER_MIN_INTERVAL', 5)
-        self.max_retries = getattr(Config, 'PUBLISHER_MAX_RETRIES', 3)
+        self.min_interval = getattr(Config, 'PUBLISHER_MIN_INTERVAL', 2)  # Reduzido
         self.storage_base_url = getattr(
             Config,
             'STORAGE_BASE_URL',
             'https://storage-becker.nyc3.digitaloceanspaces.com'
         )
 
-        # Download manager
+        # Workers
+        self.model_workers = model_workers
+        self.thumb_workers = thumb_workers
+
+        # Download manager com mais workers
         self.download_manager = DownloadManager(
             num_workers=download_workers,
             timeout=getattr(Config, 'DOWNLOAD_TIMEOUT', 120)
         )
 
+        # Thread pool para FFmpeg (CPU-bound)
+        self._thread_pool = ThreadPoolExecutor(max_workers=thumb_workers)
+
         # Cache de bot services
         self._bot_services: Dict[int, BotServiceV2] = {}
 
-        # Diretório temporário para downloads
+        # Diretório temporário
         self._temp_dir = tempfile.mkdtemp(prefix="publisher_")
+
+        # Semáforo para controle de envio ao Telegram
+        self._send_semaphore = asyncio.Semaphore(model_workers)
+
         logger.info(f"📁 Temp dir: {self._temp_dir}")
+        logger.info(f"⚡ Config: {download_workers} download, {model_workers} model, {thumb_workers} thumb workers")
 
     async def _get_bot_service(self, bot_id: int) -> Optional[BotServiceV2]:
-        """Retorna instância do BotServiceV2 para um bot"""
         if bot_id not in self._bot_services:
             bot = self.bots_repo.find(bot_id)
             if not bot or not bot.get("active"):
@@ -223,26 +214,21 @@ class PublisherServiceV2:
         return self._bot_services[bot_id]
 
     async def close(self):
-        """Fecha todas as conexões e limpa arquivos temporários"""
-        # Fecha bot services
         for bot_service in self._bot_services.values():
             await bot_service.close()
         self._bot_services.clear()
 
-        # Fecha download manager
         await self.download_manager.close()
+        self._thread_pool.shutdown(wait=False)
 
-        # Limpa diretório temporário
         if os.path.exists(self._temp_dir):
             shutil.rmtree(self._temp_dir)
-            logger.info(f"🗑️ Temp dir removido: {self._temp_dir}")
+            logger.info(f"🗑️ Temp dir removido")
 
     def _get_temp_path(self, media_id: int, extension: str) -> str:
-        """Gera caminho temporário para uma mídia"""
         return os.path.join(self._temp_dir, f"media_{media_id}{extension}")
 
     def _get_extension_from_mime(self, mime_type: str) -> str:
-        """Retorna extensão baseada no mime type"""
         mime_map = {
             'image/jpeg': '.jpg',
             'image/png': '.png',
@@ -255,67 +241,41 @@ class PublisherServiceV2:
         }
         return mime_map.get(mime_type, '.bin')
 
-    def _extract_video_thumbnail(self, video_path: str) -> Optional[str]:
-        """
-        Extrai um frame do vídeo para usar como thumbnail.
-
-        Args:
-            video_path: Caminho do vídeo
-
-        Returns:
-            Caminho do thumbnail ou None se falhar
-        """
+    def _extract_video_thumbnail_sync(self, video_path: str) -> Optional[str]:
+        """Versão síncrona para rodar em thread pool"""
         try:
             thumb_path = video_path.rsplit('.', 1)[0] + '_thumb.jpg'
 
-            # Extrai frame em 1 segundo do vídeo
-            # -ss 1: vai para 1 segundo
-            # -vframes 1: captura 1 frame
-            # -vf scale: redimensiona para max 320px mantendo proporção
             cmd = [
-                'ffmpeg',
+                'ffmpeg', '-y',
                 '-i', video_path,
                 '-ss', '1',
                 '-vframes', '1',
                 '-vf', 'scale=320:-1',
-                '-y',  # Sobrescreve se existir
+                '-q:v', '3',
                 thumb_path
             ]
 
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                timeout=30
-            )
+            result = subprocess.run(cmd, capture_output=True, timeout=15)
 
             if result.returncode == 0 and os.path.exists(thumb_path):
-                logger.debug(f"🖼️ Thumbnail extraído: {thumb_path}")
                 return thumb_path
-            else:
-                # Tenta extrair do início se 1s falhar
-                cmd[4] = '0'
-                result = subprocess.run(cmd, capture_output=True, timeout=30)
 
-                if result.returncode == 0 and os.path.exists(thumb_path):
-                    return thumb_path
+            # Tenta do início
+            cmd[5] = '0'
+            result = subprocess.run(cmd, capture_output=True, timeout=15)
 
-                logger.warning(f"⚠️ Falha ao extrair thumbnail: {result.stderr.decode()[:200]}")
-                return None
+            if result.returncode == 0 and os.path.exists(thumb_path):
+                return thumb_path
 
-        except subprocess.TimeoutExpired:
-            logger.warning(f"⚠️ Timeout ao extrair thumbnail de {video_path}")
             return None
+
         except Exception as e:
-            logger.warning(f"⚠️ Erro ao extrair thumbnail: {e}")
+            logger.warning(f"⚠️ Erro thumb: {e}")
             return None
 
-    def _get_video_metadata(self, video_path: str) -> Dict[str, Any]:
-        """
-        Obtém metadados do vídeo (duração, dimensões).
-
-        Returns:
-            Dict com duration, width, height
-        """
+    def _get_video_metadata_sync(self, video_path: str) -> Dict[str, Any]:
+        """Versão síncrona para rodar em thread pool"""
         try:
             cmd = [
                 'ffprobe',
@@ -326,17 +286,12 @@ class PublisherServiceV2:
                 video_path
             ]
 
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                timeout=30
-            )
+            result = subprocess.run(cmd, capture_output=True, timeout=10)
 
             if result.returncode == 0:
                 import json
                 data = json.loads(result.stdout)
 
-                # Busca stream de vídeo
                 video_stream = None
                 for stream in data.get('streams', []):
                     if stream.get('codec_type') == 'video':
@@ -345,13 +300,11 @@ class PublisherServiceV2:
 
                 metadata = {}
 
-                # Duração
                 if 'format' in data:
                     duration = data['format'].get('duration')
                     if duration:
                         metadata['duration'] = int(float(duration))
 
-                # Dimensões
                 if video_stream:
                     metadata['width'] = video_stream.get('width')
                     metadata['height'] = video_stream.get('height')
@@ -359,16 +312,46 @@ class PublisherServiceV2:
                 return metadata
 
         except Exception as e:
-            logger.warning(f"⚠️ Erro ao obter metadata: {e}")
+            pass
 
         return {}
+
+    async def _extract_thumbnails_parallel(self, items: List[Dict]) -> None:
+        """Extrai thumbnails em paralelo usando thread pool"""
+        loop = asyncio.get_event_loop()
+
+        async def process_item(data):
+            if data["type"] == "video":
+                # Extrai thumb em thread separada
+                thumb_path = await loop.run_in_executor(
+                    self._thread_pool,
+                    self._extract_video_thumbnail_sync,
+                    data["dest_path"]
+                )
+                if thumb_path:
+                    data["thumb_path"] = thumb_path
+
+                # Obtém metadados em thread separada
+                metadata = await loop.run_in_executor(
+                    self._thread_pool,
+                    self._get_video_metadata_sync,
+                    data["dest_path"]
+                )
+                if metadata.get("duration"):
+                    data["duration"] = metadata["duration"]
+                if metadata.get("width"):
+                    data["width"] = metadata["width"]
+                if metadata.get("height"):
+                    data["height"] = metadata["height"]
+
+        # Processa todos em paralelo
+        await asyncio.gather(*[process_item(item) for item in items])
 
     # =====================================================
     # PROCESSAMENTO PRINCIPAL
     # =====================================================
 
     async def process_queue(self, group_id: int = None, limit: int = None):
-        """Processa itens da fila de publicação."""
         limit = limit or self.batch_size * 10
 
         logger.info(f"🚀 Processando fila (limit={limit})")
@@ -392,7 +375,6 @@ class PublisherServiceV2:
             await self._process_group_items(gid, items)
 
     async def _process_group_items(self, group_id: int, items: List[Dict]):
-        """Processa itens de um grupo específico."""
         logger.info(f"🎯 Processando grupo {group_id} ({len(items)} itens)")
 
         rules = self.rules_repo.get_rules_for_group(group_id)
@@ -402,13 +384,13 @@ class PublisherServiceV2:
         batch_size = rule.get("batch_size", self.batch_size)
 
         if random_model:
-            await self._process_random_model(group_id, items, batch_size)
+            await self._process_random_model_parallel(group_id, items, batch_size)
         else:
             await self._process_sequential(group_id, items, batch_size)
 
-    async def _process_random_model(self, group_id: int, items: List[Dict], batch_size: int):
-        """Processa itens agrupados por modelo com download paralelo."""
-        logger.info(f"🎲 Modo Random Model (batch_size={batch_size})")
+    async def _process_random_model_parallel(self, group_id: int, items: List[Dict], batch_size: int):
+        """Processa múltiplos modelos em paralelo"""
+        logger.info(f"🎲 Modo Random Model PARALELO (batch={batch_size}, workers={self.model_workers})")
 
         # Agrupa por model_id
         items_by_model = defaultdict(list)
@@ -438,11 +420,7 @@ class PublisherServiceV2:
                 if 0 not in model_info:
                     model_info[0] = {"model_id": 0, "full_name": "Unknown", "stage_name": "unknown"}
 
-        logger.info(f"📊 {len(items_by_model)} modelos encontrados")
-
-        # Embaralha modelos
-        model_ids = list(items_by_model.keys())
-        random.shuffle(model_ids)
+        logger.info(f"📊 {len(items_by_model)} modelos para processar")
 
         # Busca bot do grupo
         group_bot = self.group_bots_repo.get_publisher_bot(group_id)
@@ -456,40 +434,43 @@ class PublisherServiceV2:
             logger.error(f"❌ Bot {bot_id} não disponível")
             return
 
+        # Prepara tasks para cada modelo
+        model_ids = list(items_by_model.keys())
+        random.shuffle(model_ids)
+
+        # Processa modelos em paralelo
+        results = await asyncio.gather(*[
+            self._process_single_model(
+                bot_service, bot_id, group_id,
+                items_by_model[mid][:batch_size],
+                model_info[mid],
+                model_index=i
+            )
+            for i, mid in enumerate(model_ids)
+        ], return_exceptions=True)
+
+        # Consolida resultados
         total_processed = 0
         total_failed = 0
 
-        # Processa cada modelo
-        for mid in model_ids:
-            model_items = items_by_model[mid]
-            info = model_info[mid]
-            batch = model_items[:batch_size]
-
-            logger.info(f"👤 Modelo: {info['full_name']} ({len(batch)} mídias)")
-
-            caption = f"#{info['stage_name']}\n{info['full_name']}"
-
-            processed, failed = await self._publish_album_with_download(
-                bot_service, bot_id, group_id, batch, caption
-            )
-
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"❌ Erro em modelo: {result}")
+                continue
+            processed, failed = result
             total_processed += processed
             total_failed += failed
 
-            await asyncio.sleep(self.min_interval)
+        logger.info(f"✅ Paralelo concluído: {total_processed} ok, {total_failed} falhas")
 
-        logger.info(f"✅ Random Model concluído: {total_processed} ok, {total_failed} falhas")
+    async def _process_single_model(self, bot_service: BotServiceV2, bot_id: int,
+                                    group_id: int, items: List[Dict],
+                                    info: Dict, model_index: int) -> tuple:
+        """Processa um modelo completo (download + thumb + envio)"""
 
-    # =====================================================
-    # DOWNLOAD + PUBLICAÇÃO VIA FORMDATA
-    # =====================================================
+        model_name = info['full_name']
+        logger.info(f"👤 [{model_index}] Iniciando: {model_name} ({len(items)} mídias)")
 
-    async def _publish_album_with_download(self, bot_service: BotServiceV2, bot_id: int,
-                                           group_id: int, items: List[Dict],
-                                           caption: str) -> tuple:
-        """
-        Baixa mídias em paralelo e envia álbum via FormData com thumbnails.
-        """
         # Prepara lista de downloads
         download_items = []
 
@@ -498,7 +479,6 @@ class PublisherServiceV2:
             media = self.media_repo.find(media_id)
 
             if not media:
-                logger.warning(f"⚠️ Mídia {media_id} não encontrada")
                 self.queue_repo.mark_failed(item["id"], "Mídia não encontrada")
                 continue
 
@@ -506,20 +486,14 @@ class PublisherServiceV2:
             storage_key = media.get("storage_key", "")
 
             if not storage_key:
-                logger.warning(f"⚠️ Mídia {media_id} sem storage_key")
                 self.queue_repo.mark_failed(item["id"], "Sem storage_key")
                 continue
 
-            # URL e caminho temporário
             media_url = f"{self.storage_base_url}/{storage_key}"
             extension = self._get_extension_from_mime(mime_type)
             temp_path = self._get_temp_path(media_id, extension)
 
-            # Determina tipo
-            if mime_type.startswith("video/"):
-                media_type = "video"
-            else:
-                media_type = "photo"
+            media_type = "video" if mime_type.startswith("video/") else "photo"
 
             download_items.append({
                 "item": item,
@@ -533,12 +507,9 @@ class PublisherServiceV2:
         if not download_items:
             return (0, len(items))
 
-        # === FASE 1: Download paralelo ===
-        logger.info(f"📥 Baixando {len(download_items)} mídias...")
-
+        # FASE 1: Download
         downloaded_items = await self.download_manager.download_batch(download_items)
 
-        # Filtra apenas os que baixaram com sucesso
         ready_items = []
         failed_count = 0
 
@@ -546,264 +517,107 @@ class PublisherServiceV2:
             if data.get("downloaded"):
                 ready_items.append(data)
             else:
-                # Marca como falha
                 self.queue_repo.mark_failed(
                     data["item"]["id"],
-                    f"Falha no download: {data['url']}"
+                    f"Falha no download"
                 )
-                self._log_action(None, "download_failed", {
-                    "media_id": data["media_id"],
-                    "url": data["url"]
-                })
                 self.stats_repo.increment_failed(group_id)
                 failed_count += 1
 
         if not ready_items:
-            logger.error("❌ Nenhuma mídia baixada com sucesso")
             return (0, failed_count)
 
-        # === FASE 2: Extrair thumbnails e metadados de vídeos ===
-        logger.info(f"🖼️ Processando thumbnails e metadados...")
+        # FASE 2: Extração de thumbnails em paralelo
+        await self._extract_thumbnails_parallel(ready_items)
 
-        for data in ready_items:
-            if data["type"] == "video":
-                # Extrai thumbnail
-                thumb_path = self._extract_video_thumbnail(data["dest_path"])
-                if thumb_path:
-                    data["thumb_path"] = thumb_path
+        # FASE 3: Envio (com semáforo para não sobrecarregar o Telegram)
+        async with self._send_semaphore:
+            caption = f"#{info['stage_name']}\n{info['full_name']}"
 
-                # Obtém metadados
-                metadata = self._get_video_metadata(data["dest_path"])
-                if metadata.get("duration"):
-                    data["duration"] = metadata["duration"]
-                if metadata.get("width"):
-                    data["width"] = metadata["width"]
-                if metadata.get("height"):
-                    data["height"] = metadata["height"]
-
-        # === FASE 3: Envio via FormData com thumbnails ===
-        logger.info(f"📤 Enviando {len(ready_items)} mídias via FormData...")
-
-        try:
-            # Prepara items para send_media_group_with_thumbs
-            upload_items = []
-            for i, data in enumerate(ready_items):
-                upload_item = {
-                    "temp_path": data["dest_path"],
-                    "type": data["type"],
-                    "data": data  # Preserva dados originais
-                }
-
-                # Adiciona thumb e metadados para vídeos
-                if data["type"] == "video":
-                    if data.get("thumb_path"):
-                        upload_item["thumb_path"] = data["thumb_path"]
-                    if data.get("duration"):
-                        upload_item["duration"] = data["duration"]
-                    if data.get("width"):
-                        upload_item["width"] = data["width"]
-                    if data.get("height"):
-                        upload_item["height"] = data["height"]
-
-                upload_items.append(upload_item)
-
-            # Envia álbum
-            results = await bot_service.send_media_group_with_thumbs(
-                chat_id=group_id,
-                items=upload_items,
-                caption=caption,
-                disable_notification=False
-            )
-
-            # Registra publicações
-            processed = 0
-            for i, result in enumerate(results):
-                if i < len(ready_items):
-                    data = ready_items[i]
-
-                    publish_id = self.group_publish_repo.create({
-                        "group_id": group_id,
-                        "media_id": data["media_id"],
-                        "bot_id": bot_id,
-                        "telegram_message_id": result.get("message_id"),
-                        "file_id": self._extract_file_id(result),
-                        "caption": caption if i == 0 else None,
-                        "status": "published",
-                        "published_at": datetime.now().isoformat()
-                    })
-
-                    self.queue_repo.mark_completed(data["item"]["id"])
-                    self._log_action(publish_id["id"], "published", {
-                        "via": "formdata",
-                        "file_size": os.path.getsize(data["dest_path"]),
-                        "has_thumb": bool(data.get("thumb_path"))
-                    })
-                    processed += 1
-
-            self.stats_repo.increment_published(group_id, processed)
-            logger.info(f"✅ Álbum publicado ({processed} mídias)")
-
-            return (processed, failed_count)
-
-        except BotApiError as e:
-            error_msg = str(e)
-            logger.error(f"❌ Erro ao enviar álbum: {error_msg}")
-
-            # Tenta identificar mídia problemática
-            import re
-            match = re.search(r'message #(\d+)', error_msg)
-            failed_index = int(match.group(1)) - 1 if match else -1
-
-            # Processa falhas
-            success_items = []
-
-            for i, data in enumerate(ready_items):
-                if i == failed_index:
-                    self.queue_repo.mark_failed(data["item"]["id"], error_msg)
-                    self._log_action(None, "upload_failed", {
-                        "media_id": data["media_id"],
-                        "error": error_msg,
-                        "temp_path": data["dest_path"]
-                    })
-                    self.stats_repo.increment_failed(group_id)
-                    failed_count += 1
-                    logger.error(f"❌ Mídia falhou: {data['media_id']}")
-                else:
-                    success_items.append(data)
-
-            # Tenta reenviar os restantes
-            if success_items and len(success_items) >= 1:
-                logger.info(f"🔄 Tentando enviar {len(success_items)} mídias restantes...")
-
-                # Reconstrói items para recursão
-                retry_queue_items = [d["item"] for d in success_items]
-
-                # Cria items já baixados
-                retry_download_items = []
-                for d in success_items:
-                    retry_item = {
-                        "item": d["item"],
-                        "media_id": d["media_id"],
-                        "dest_path": d["dest_path"],
-                        "type": d["type"],
-                        "downloaded": True
+            try:
+                upload_items = []
+                for data in ready_items:
+                    upload_item = {
+                        "temp_path": data["dest_path"],
+                        "type": data["type"],
                     }
-                    # Preserva thumb e metadados
-                    if d.get("thumb_path"):
-                        retry_item["thumb_path"] = d["thumb_path"]
-                    if d.get("duration"):
-                        retry_item["duration"] = d["duration"]
-                    if d.get("width"):
-                        retry_item["width"] = d["width"]
-                    if d.get("height"):
-                        retry_item["height"] = d["height"]
 
-                    retry_download_items.append(retry_item)
+                    if data["type"] == "video":
+                        if data.get("thumb_path"):
+                            upload_item["thumb_path"] = data["thumb_path"]
+                        if data.get("duration"):
+                            upload_item["duration"] = data["duration"]
+                        if data.get("width"):
+                            upload_item["width"] = data["width"]
+                        if data.get("height"):
+                            upload_item["height"] = data["height"]
 
-                # Envia diretamente (já baixados)
-                processed, more_failed = await self._send_downloaded_album(
-                    bot_service, bot_id, group_id, retry_download_items, caption
+                    upload_items.append(upload_item)
+
+                results = await bot_service.send_media_group_with_thumbs(
+                    chat_id=group_id,
+                    items=upload_items,
+                    caption=caption,
+                    disable_notification=False
                 )
-                return (processed, failed_count + more_failed)
 
-            return (0, failed_count)
+                # Registra publicações
+                processed = 0
+                for i, result in enumerate(results):
+                    if i < len(ready_items):
+                        data = ready_items[i]
 
-        finally:
-            # Limpa arquivos temporários deste batch
-            for data in ready_items:
-                # Remove arquivo principal
-                temp_path = data.get("dest_path")
-                if temp_path and os.path.exists(temp_path):
-                    try:
-                        os.remove(temp_path)
-                    except Exception as e:
-                        logger.warning(f"⚠️ Erro ao remover temp: {temp_path}: {e}")
+                        publish_id = self.group_publish_repo.create({
+                            "group_id": group_id,
+                            "media_id": data["media_id"],
+                            "bot_id": bot_id,
+                            "telegram_message_id": result.get("message_id"),
+                            "file_id": self._extract_file_id(result),
+                            "caption": caption if i == 0 else None,
+                            "status": "published",
+                            "published_at": datetime.now().isoformat()
+                        })
 
-                # Remove thumbnail
-                thumb_path = data.get("thumb_path")
-                if thumb_path and os.path.exists(thumb_path):
-                    try:
-                        os.remove(thumb_path)
-                    except Exception as e:
-                        logger.warning(f"⚠️ Erro ao remover thumb: {thumb_path}: {e}")
+                        self.queue_repo.mark_completed(data["item"]["id"])
+                        self._log_action(publish_id["id"], "published", {
+                            "via": "parallel",
+                            "model": info['stage_name']
+                        })
+                        processed += 1
 
-    async def _send_downloaded_album(self, bot_service: BotServiceV2, bot_id: int,
-                                     group_id: int, items: List[Dict],
-                                     caption: str) -> tuple:
-        """
-        Envia álbum com arquivos já baixados (incluindo thumbs).
-        """
-        if not items:
-            return (0, 0)
+                self.stats_repo.increment_published(group_id, processed)
+                logger.info(f"✅ [{model_index}] {model_name}: {processed} mídias")
 
-        try:
-            upload_items = []
-            for data in items:
-                upload_item = {
-                    "temp_path": data["dest_path"],
-                    "type": data["type"],
-                    "data": data
-                }
+                # Intervalo mínimo entre envios
+                await asyncio.sleep(self.min_interval)
 
-                # Adiciona thumb e metadados para vídeos
-                if data["type"] == "video":
-                    if data.get("thumb_path"):
-                        upload_item["thumb_path"] = data["thumb_path"]
-                    if data.get("duration"):
-                        upload_item["duration"] = data["duration"]
-                    if data.get("width"):
-                        upload_item["width"] = data["width"]
-                    if data.get("height"):
-                        upload_item["height"] = data["height"]
+                return (processed, failed_count)
 
-                upload_items.append(upload_item)
+            except BotApiError as e:
+                logger.error(f"❌ [{model_index}] Erro ao enviar: {e}")
 
-            results = await bot_service.send_media_group_with_thumbs(
-                chat_id=group_id,
-                items=upload_items,
-                caption=caption,
-                disable_notification=False
-            )
+                for data in ready_items:
+                    self.queue_repo.mark_failed(data["item"]["id"], str(e))
+                    self.stats_repo.increment_failed(group_id)
 
-            processed = 0
-            for i, result in enumerate(results):
-                if i < len(items):
-                    data = items[i]
+                return (0, len(ready_items) + failed_count)
 
-                    publish_id = self.group_publish_repo.create({
-                        "group_id": group_id,
-                        "media_id": data["media_id"],
-                        "bot_id": bot_id,
-                        "telegram_message_id": result.get("message_id"),
-                        "file_id": self._extract_file_id(result),
-                        "caption": caption if i == 0 else None,
-                        "status": "published",
-                        "published_at": datetime.now().isoformat()
-                    })
-
-                    self.queue_repo.mark_completed(data["item"]["id"])
-                    self._log_action(publish_id["id"], "published", {"via": "formdata_retry"})
-                    processed += 1
-
-            self.stats_repo.increment_published(group_id, processed)
-            return (processed, 0)
-
-        except BotApiError as e:
-            logger.error(f"❌ Erro no retry: {e}")
-
-            # Marca todos como falha
-            for data in items:
-                self.queue_repo.mark_failed(data["item"]["id"], str(e))
-                self.stats_repo.increment_failed(group_id)
-
-            return (0, len(items))
+            finally:
+                # Limpa arquivos
+                for data in ready_items:
+                    for path_key in ["dest_path", "thumb_path"]:
+                        path = data.get(path_key)
+                        if path and os.path.exists(path):
+                            try:
+                                os.remove(path)
+                            except:
+                                pass
 
     # =====================================================
-    # MODO SEQUENCIAL
+    # MODO SEQUENCIAL (fallback)
     # =====================================================
 
     async def _process_sequential(self, group_id: int, items: List[Dict], batch_size: int):
-        """Processa itens sequencialmente com download individual."""
         logger.info(f"📝 Modo Sequencial (batch_size={batch_size})")
 
         batch = items[:batch_size]
@@ -823,11 +637,9 @@ class PublisherServiceV2:
 
             await asyncio.sleep(self.min_interval)
 
-        logger.info(f"✅ Sequencial concluído: {processed} ok, {failed} falhas")
+        logger.info(f"✅ Sequencial: {processed} ok, {failed} falhas")
 
-    async def _publish_single_item(self, queue_item: Dict, group_id: int,
-                                   caption: str = None) -> bool:
-        """Publica um item individual com download e FormData."""
+    async def _publish_single_item(self, queue_item: Dict, group_id: int) -> bool:
         queue_id = queue_item["id"]
         media_id = queue_item["media_id"]
 
@@ -850,40 +662,34 @@ class PublisherServiceV2:
             mime_type = media.get("mime", "")
             storage_key = media.get("storage_key", "")
 
-            # Download
             media_url = f"{self.storage_base_url}/{storage_key}"
             extension = self._get_extension_from_mime(mime_type)
             temp_path = self._get_temp_path(media_id, extension)
 
-            # Baixa arquivo
             download_result = await self.download_manager.download_batch([{
                 "url": media_url,
                 "dest_path": temp_path
             }])
 
             if not download_result or not download_result[0].get("downloaded"):
-                raise PublishError(f"Falha no download: {media_url}")
+                raise PublishError(f"Falha no download")
 
             try:
-                # Envia via arquivo local
                 if mime_type.startswith("image/"):
                     result = await bot_service.send_photo(
                         chat_id=group_id,
-                        photo=temp_path,
-                        caption=caption
+                        photo=temp_path
                     )
                 elif mime_type.startswith("video/"):
                     result = await bot_service.send_video(
                         chat_id=group_id,
                         video=temp_path,
-                        caption=caption,
                         supports_streaming=True
                     )
                 else:
                     result = await bot_service.send_document(
                         chat_id=group_id,
-                        document=temp_path,
-                        caption=caption
+                        document=temp_path
                     )
 
                 publish_id = self.group_publish_repo.create({
@@ -892,30 +698,22 @@ class PublisherServiceV2:
                     "bot_id": bot_id,
                     "telegram_message_id": result.get("message_id"),
                     "file_id": self._extract_file_id(result),
-                    "caption": caption,
                     "status": "published",
                     "published_at": datetime.now().isoformat()
                 })
 
                 self.queue_repo.mark_completed(queue_id)
-                self._log_action(publish_id["id"], "published", {"via": "individual_formdata"})
+                self._log_action(publish_id["id"], "published", {"via": "sequential"})
                 self.stats_repo.increment_published(group_id)
 
                 return True
 
             finally:
-                # Limpa arquivo temporário
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
 
-        except PublishError as e:
+        except (PublishError, BotApiError) as e:
             logger.error(f"❌ {e}")
-            self.queue_repo.mark_failed(queue_id, str(e))
-            self.stats_repo.increment_failed(group_id)
-            return False
-
-        except BotApiError as e:
-            logger.error(f"❌ API Error: {e}")
             self.queue_repo.mark_failed(queue_id, str(e))
             self.stats_repo.increment_failed(group_id)
             return False
@@ -925,7 +723,6 @@ class PublisherServiceV2:
     # =====================================================
 
     def _extract_file_id(self, result: Dict) -> Optional[str]:
-        """Extrai file_id da resposta"""
         for field in ["photo", "video", "document", "animation"]:
             if field in result:
                 content = result[field]
@@ -937,27 +734,18 @@ class PublisherServiceV2:
     def _log_action(self, publish_id, action: str, details: dict):
         try:
             import json
-
             details_str = json.dumps(details) if isinstance(details, dict) else str(details)
 
-            payload = {
-                "group_publish_id": publish_id,  # <- AQUI O FIX
+            self.log_repo.create({
+                "group_publish_id": publish_id,
                 "action": action,
                 "details": details_str,
                 "created_at": datetime.now().isoformat()
-            }
-
-            self.log_repo.create(payload)
-
+            })
         except Exception as e:
-            logger.warning(f"⚠️ Erro ao registrar log: {e}")
-
-    # =====================================================
-    # MÉTODOS PÚBLICOS
-    # =====================================================
+            logger.warning(f"⚠️ Erro log: {e}")
 
     def add_to_queue(self, group_id: int, media_id: int, priority: int = 0):
-        """Adiciona mídia à fila."""
         if self.queue_repo.is_in_queue(group_id, media_id):
             return False
         if self.group_publish_repo.is_media_published(group_id, media_id):
@@ -966,13 +754,11 @@ class PublisherServiceV2:
         return True
 
     def get_queue_status(self) -> Dict:
-        """Retorna status da fila"""
         stats = self.queue_repo.get_queue_stats()
         return {stat["status"]: stat["count"] for stat in stats}
 
 
 class PublishError(Exception):
-    """Erro de publicação"""
     pass
 
 
@@ -988,19 +774,25 @@ async def main():
         format="%(asctime)s [%(levelname)s] %(message)s"
     )
 
-    parser = argparse.ArgumentParser(description="Publisher V2 - Com Download Workers")
-    parser.add_argument("--limit", type=int, default=10, help="Limite de itens")
-    parser.add_argument("--workers", type=int, default=5, help="Número de download workers")
-    parser.add_argument("--loop", action="store_true", help="Modo loop contínuo")
-    parser.add_argument("--interval", type=int, default=60, help="Intervalo do loop")
+    parser = argparse.ArgumentParser(description="Publisher V3 - Máxima Performance")
+    parser.add_argument("--limit", type=int, default=50, help="Limite de itens")
+    parser.add_argument("--download-workers", type=int, default=12, help="Workers de download")
+    parser.add_argument("--model-workers", type=int, default=4, help="Modelos em paralelo")
+    parser.add_argument("--thumb-workers", type=int, default=6, help="Workers de thumbnail")
+    parser.add_argument("--loop", action="store_true", help="Modo loop")
+    parser.add_argument("--interval", type=int, default=30, help="Intervalo do loop")
 
     args = parser.parse_args()
 
-    publisher = PublisherServiceV2(download_workers=args.workers)
+    publisher = PublisherServiceV3(
+        download_workers=args.download_workers,
+        model_workers=args.model_workers,
+        thumb_workers=args.thumb_workers
+    )
 
     try:
         if args.loop:
-            logger.info(f"🔄 Modo loop (intervalo: {args.interval}s, workers: {args.workers})")
+            logger.info(f"🔄 Loop mode (interval: {args.interval}s)")
 
             while True:
                 status = publisher.get_queue_status()
@@ -1012,7 +804,6 @@ async def main():
                 else:
                     logger.info("📭 Fila vazia")
 
-                logger.info(f"💤 Aguardando {args.interval}s...")
                 await asyncio.sleep(args.interval)
         else:
             status = publisher.get_queue_status()
