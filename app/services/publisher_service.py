@@ -447,44 +447,76 @@ class PublisherServiceV3:
 
         logger.info(f"🤖 {len(bot_services)} bots disponíveis para rotação")
 
-        # Prepara tasks para cada modelo
-        model_ids = list(items_by_model.keys())
-        random.shuffle(model_ids)
+        # Prepara TODOS os batches de TODOS os modelos
+        all_batches = []
 
-        # Processa modelos em paralelo, distribuindo entre os bots
-        results = await asyncio.gather(*[
-            self._process_single_model(
-                bot_services[i % len(bot_services)][1],  # Rotaciona bots
-                bot_services[i % len(bot_services)][0],  # bot_id
-                group_id,
-                items_by_model[mid][:batch_size],
-                model_info[mid],
-                model_index=i
-            )
-            for i, mid in enumerate(model_ids)
-        ], return_exceptions=True)
+        for model_id, model_items in items_by_model.items():
+            info = model_info[model_id]
 
-        # Consolida resultados
+            # Divide em batches
+            num_batches = (len(model_items) + batch_size - 1) // batch_size
+
+            for batch_idx in range(num_batches):
+                start = batch_idx * batch_size
+                end = min(start + batch_size, len(model_items))
+                batch = model_items[start:end]
+
+                all_batches.append({
+                    "model_id": model_id,
+                    "info": info,
+                    "items": batch,
+                    "batch_num": batch_idx + 1,
+                    "total_batches": num_batches
+                })
+
+        # Embaralha batches para intercalar modelos
+        random.shuffle(all_batches)
+
+        total_batches = len(all_batches)
+        logger.info(f"📦 {total_batches} batches totais para processar")
+
+        # Processa batches em paralelo com limite de workers
         total_processed = 0
         total_failed = 0
 
-        for result in results:
-            if isinstance(result, Exception):
-                logger.error(f"❌ Erro em modelo: {result}")
-                continue
-            processed, failed = result
-            total_processed += processed
-            total_failed += failed
+        # Processa em chunks do tamanho de model_workers
+        for chunk_start in range(0, total_batches, self.model_workers):
+            chunk_end = min(chunk_start + self.model_workers, total_batches)
+            chunk = all_batches[chunk_start:chunk_end]
+
+            # Processa este chunk em paralelo
+            results = await asyncio.gather(*[
+                self._process_single_model(
+                    bot_services[i % len(bot_services)][1],  # Rotaciona bots
+                    bot_services[i % len(bot_services)][0],  # bot_id
+                    group_id,
+                    batch["items"],
+                    batch["info"],
+                    model_index=chunk_start + i,
+                    batch_info=f"{batch['batch_num']}/{batch['total_batches']}"
+                )
+                for i, batch in enumerate(chunk)
+            ], return_exceptions=True)
+
+            # Consolida resultados
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error(f"❌ Erro em batch: {result}")
+                    continue
+                processed, failed = result
+                total_processed += processed
+                total_failed += failed
 
         logger.info(f"✅ Paralelo concluído: {total_processed} ok, {total_failed} falhas")
 
     async def _process_single_model(self, bot_service: BotServiceV2, bot_id: int,
                                     group_id: int, items: List[Dict],
-                                    info: Dict, model_index: int) -> tuple:
+                                    info: Dict, model_index: int, batch_info: str = "") -> tuple:
         """Processa um modelo completo (download + thumb + envio)"""
 
         model_name = info['full_name']
-        logger.info(f"👤 [{model_index}] Iniciando: {model_name} ({len(items)} mídias)")
+        batch_label = f" [Batch {batch_info}]" if batch_info else ""
+        logger.info(f"👤 [{model_index}] Iniciando: {model_name}{batch_label} ({len(items)} mídias)")
 
         # Prepara lista de downloads
         download_items = []

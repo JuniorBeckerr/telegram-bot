@@ -41,6 +41,7 @@ class PublishQueueRepository(BaseRepository):
             "media_id": media_id,
             "priority": priority,
             "scheduled_at": scheduled_at,
+            "max_attempts": 3,
             "status": "pending",
             "attempts": 0
         })
