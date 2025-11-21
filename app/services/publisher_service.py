@@ -541,11 +541,12 @@ class PublisherServiceV3:
         logger.info(f"✅ [{model_index}] {model_name} completo: {total_processed} ok, {total_failed} falhas")
 
         return (total_processed, total_failed)
+
     async def _process_single_batch(self, bot_service: BotServiceV2, bot_id: int,
                                     group_id: int, items: List[Dict],
                                     info: Dict, model_index: int, batch_info: str = "",
                                     all_bot_services: List[tuple] = None) -> tuple:
-        """Processa um único batch com rotação de bots e retry apenas como fallback"""
+        """Processa um único batch com rotação de bots apenas para rate limit"""
 
         model_name = info['full_name']
         batch_label = f" [Batch {batch_info}]" if batch_info else ""
@@ -610,7 +611,7 @@ class PublisherServiceV3:
         # FASE 2: Extração de thumbnails em paralelo
         await self._extract_thumbnails_parallel(ready_items)
 
-        # FASE 3: Envio com rotação de bots
+        # FASE 3: Envio com rotação de bots APENAS para rate limit
         async with self._send_semaphore:
             caption = f"#{info['stage_name']}\n{info['full_name']}"
 
@@ -634,109 +635,123 @@ class PublisherServiceV3:
 
                     upload_items.append(upload_item)
 
-                # ESTRATÉGIA: Tenta com todos os bots disponíveis antes de fazer retry
+                # ESTRATÉGIA: Rotaciona bots APENAS em caso de rate limit
                 results = None
                 used_bot_id = bot_id
                 last_error = None
 
-                # Se temos múltiplos bots, tenta com cada um
-                if all_bot_services and len(all_bot_services) > 1:
-                    # Começa pelo bot atual, depois tenta os outros
-                    bots_to_try = [bs for bs in all_bot_services if bs[0] == bot_id]
-                    bots_to_try.extend([bs for bs in all_bot_services if bs[0] != bot_id])
+                # Tenta com o bot atual primeiro
+                try:
+                    results = await bot_service.send_media_group_with_thumbs(
+                        chat_id=group_id,
+                        items=upload_items,
+                        caption=caption,
+                        disable_notification=False
+                    )
 
-                    for attempt_bot_id, attempt_bot_service in bots_to_try:
-                        try:
-                            results = await attempt_bot_service.send_media_group_with_thumbs(
-                                chat_id=group_id,
-                                items=upload_items,
-                                caption=caption,
-                                disable_notification=False
-                            )
-                            used_bot_id = attempt_bot_id
+                except BotApiError as e:
+                    last_error = e
+                    error_msg = str(e).lower()
 
-                            if attempt_bot_id != bot_id:
+                    # APENAS rate limit → tenta outros bots
+                    if ("too many requests" in error_msg or "429" in error_msg) and all_bot_services and len(all_bot_services) > 1:
+                        logger.warning(f"⚠️ [{model_index}]{batch_label} Rate limit no bot {bot_id}, tentando outros bots...")
+
+                        # Tenta com os outros bots disponíveis
+                        for attempt_bot_id, attempt_bot_service in all_bot_services:
+                            if attempt_bot_id == bot_id:
+                                continue  # Já tentou com este
+
+                            try:
+                                results = await attempt_bot_service.send_media_group_with_thumbs(
+                                    chat_id=group_id,
+                                    items=upload_items,
+                                    caption=caption,
+                                    disable_notification=False
+                                )
+                                used_bot_id = attempt_bot_id
                                 logger.info(f"🔄 [{model_index}]{batch_label} Sucesso com bot alternativo {attempt_bot_id}")
+                                break  # Sucesso!
 
-                            break  # Sucesso!
+                            except BotApiError as e2:
+                                error_msg2 = str(e2).lower()
 
-                        except BotApiError as e:
-                            last_error = e
-                            error_msg = str(e).lower()
+                                # Se também deu rate limit, tenta próximo
+                                if "too many requests" in error_msg2 or "429" in error_msg2:
+                                    logger.warning(f"⚠️ [{model_index}]{batch_label} Rate limit também no bot {attempt_bot_id}")
+                                    last_error = e2
+                                    continue
+                                else:
+                                    # Outros erros, para de tentar
+                                    last_error = e2
+                                    break
 
-                            # Se é rate limit, tenta próximo bot imediatamente
-                            if "too many requests" in error_msg or "429" in error_msg:
-                                logger.warning(f"⚠️ [{model_index}]{batch_label} Rate limit no bot {attempt_bot_id}, tentando próximo...")
-                                continue
-
-                            # Se é timeout, tenta próximo bot
-                            elif "timeout" in error_msg:
-                                logger.warning(f"⚠️ [{model_index}]{batch_label} Timeout no bot {attempt_bot_id}, tentando próximo...")
-                                continue
-
-                            # Outros erros, não tenta próximo bot
-                            else:
-                                logger.error(f"❌ [{model_index}]{batch_label} Erro não recuperável no bot {attempt_bot_id}: {e}")
+                            except asyncio.TimeoutError:
+                                # Timeout → ignora este bot e para de tentar
+                                logger.warning(f"⚠️ [{model_index}]{batch_label} Timeout no bot {attempt_bot_id}, ignorando...")
+                                last_error = Exception("Timeout")
                                 break
 
-                        except asyncio.TimeoutError:
-                            logger.warning(f"⚠️ [{model_index}]{batch_label} Timeout asyncio no bot {attempt_bot_id}, tentando próximo...")
-                            last_error = Exception("Timeout asyncio")
-                            continue
+                        # Se rotacionou por todos e ainda não tem resultado, usa retry
+                        if results is None:
+                            logger.warning(f"🔁 [{model_index}]{batch_label} Todos os bots com rate limit, usando retry...")
 
-                # Se não tem múltiplos bots OU todos os bots falharam com rate limit
-                # Usa estratégia de retry com backoff
-                if results is None:
-                    logger.warning(f"🔁 [{model_index}]{batch_label} Todos os bots falharam, iniciando retry com backoff...")
+                            # Retry apenas para rate limit
+                            max_retries = 3
+                            retry_count = 0
 
-                    max_retries = 3
-                    retry_count = 0
+                            while retry_count < max_retries and results is None:
+                                retry_count += 1
 
-                    while retry_count < max_retries and results is None:
-                        retry_count += 1
+                                # Extrai retry_after
+                                retry_after = None
+                                if "retry after" in str(last_error).lower():
+                                    import re
+                                    match = re.search(r'retry after (\d+)', str(last_error).lower())
+                                    if match:
+                                        retry_after = int(match.group(1))
 
-                        try:
-                            # Extrai retry_after do último erro
-                            retry_after = None
-                            if last_error and "retry after" in str(last_error).lower():
-                                import re
-                                match = re.search(r'retry after (\d+)', str(last_error).lower())
-                                if match:
-                                    retry_after = int(match.group(1))
+                                wait_time = (retry_after + 2) if retry_after else min(10 * (2 ** (retry_count - 1)), 60)
 
-                            if retry_after:
-                                wait_time = retry_after + 2
-                            else:
-                                # Backoff exponencial
-                                wait_time = min(10 * (2 ** (retry_count - 1)), 60)
+                                logger.warning(
+                                    f"⏳ [{model_index}]{batch_label} Aguardando {wait_time}s "
+                                    f"(retry {retry_count}/{max_retries})"
+                                )
 
-                            logger.warning(
-                                f"⏳ [{model_index}]{batch_label} Aguardando {wait_time}s "
-                                f"(retry {retry_count}/{max_retries})"
-                            )
+                                await asyncio.sleep(wait_time)
 
-                            await asyncio.sleep(wait_time)
+                                try:
+                                    # Tenta com o bot original
+                                    results = await bot_service.send_media_group_with_thumbs(
+                                        chat_id=group_id,
+                                        items=upload_items,
+                                        caption=caption,
+                                        disable_notification=False
+                                    )
+                                    used_bot_id = bot_id
+                                    logger.info(f"✅ [{model_index}]{batch_label} Sucesso após retry {retry_count}")
+                                    break
 
-                            # Tenta com o bot original
-                            results = await bot_service.send_media_group_with_thumbs(
-                                chat_id=group_id,
-                                items=upload_items,
-                                caption=caption,
-                                disable_notification=False
-                            )
-                            used_bot_id = bot_id
+                                except (BotApiError, asyncio.TimeoutError) as e3:
+                                    last_error = e3
+                                    if retry_count >= max_retries:
+                                        break
 
-                            logger.info(f"✅ [{model_index}]{batch_label} Sucesso após retry {retry_count}")
-                            break
+                    # Timeout ou outros erros → falha imediatamente
+                    elif "timeout" in error_msg:
+                        logger.warning(f"⏭️ [{model_index}]{batch_label} Timeout, ignorando batch e seguindo...")
+                        raise
+                    else:
+                        # Outros erros → falha imediatamente
+                        raise
 
-                        except (BotApiError, asyncio.TimeoutError) as e:
-                            last_error = e
-                            if retry_count >= max_retries:
-                                break
+                except asyncio.TimeoutError:
+                    logger.warning(f"⏭️ [{model_index}]{batch_label} Timeout asyncio, ignorando batch e seguindo...")
+                    raise
 
                 # Se ainda não tem resultados, falhou completamente
                 if results is None:
-                    raise last_error or Exception("Falha em todos os bots e retries")
+                    raise last_error or Exception("Falha após tentar todos os bots")
 
                 # Registra publicações
                 processed = 0
@@ -747,7 +762,7 @@ class PublisherServiceV3:
                         publish_id = self.group_publish_repo.create({
                             "group_id": group_id,
                             "media_id": data["media_id"],
-                            "bot_id": used_bot_id,  # Usa o bot que teve sucesso
+                            "bot_id": used_bot_id,
                             "telegram_message_id": result.get("message_id"),
                             "file_id": self._extract_file_id(result),
                             "caption": caption if i == 0 else None,
@@ -769,7 +784,7 @@ class PublisherServiceV3:
 
                 return (processed, failed_count)
 
-            except (BotApiError, Exception) as e:
+            except (BotApiError, asyncio.TimeoutError, Exception) as e:
                 logger.error(f"❌ [{model_index}]{batch_label} Erro final: {e}")
 
                 for data in ready_items:
@@ -787,7 +802,7 @@ class PublisherServiceV3:
                             try:
                                 os.remove(path)
                             except:
-                                pass    # MODO SEQUENCIAL (fallback)
+                                pass
     # =====================================================
 
     async def _process_sequential(self, group_id: int, items: List[Dict], batch_size: int):
