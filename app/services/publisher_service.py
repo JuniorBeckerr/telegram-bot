@@ -699,7 +699,7 @@ class PublisherServiceV3:
                                     f"Timeout ao enviar"
                                 )
 
-                            raise
+                            return 0, len(ready_items)
 
                         # Outros erros → para imediatamente
                         else:
@@ -716,9 +716,9 @@ class PublisherServiceV3:
                                 f"Timeout asyncio"
                             )
 
-                        raise
+                        return 0, len(ready_items)
 
-                # Se todos os bots deram rate limit, desiste
+            # Se todos os bots deram rate limit, desiste
                 if results is None:
                     error_msg = str(last_error).lower() if last_error else ""
 

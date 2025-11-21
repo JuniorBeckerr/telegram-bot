@@ -202,12 +202,6 @@ if __name__ == "__main__":
     # python publish.py --download-workers 18 --model-workers 6 --thumb-workers 8 --limit 10
 
     # python publish.py --download-workers 8 --model-workers 4 --thumb-workers 4 --limit 100
-    # nohup /home/arnaldo/projects/telegram-bot/venv/bin/python \
-    #     /home/arnaldo/projects/telegram-bot/publish.py \
-    #     --download-workers 8 \
-    #     --model-workers 4 \
-    #     --thumb-workers 4 \
-    #     --limit 100 \
-    #     > publish.log 2>&1 &
+    # nohup /home/arnaldo/projects/telegram-bot/venv/bin/python /home/arnaldo/projects/telegram-bot/publish.py --download-workers 8 --model-workers 4 --thumb-workers 4 --limit 100 > publish.log 2>&1 &
 
     # nohup /home/arnaldo/projects/telegram-bot/venv/bin/python /home/arnaldo/projects/telegram-bot/sync.py > sync.log 2>&1 &
