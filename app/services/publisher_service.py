@@ -208,7 +208,8 @@ class PublisherServiceV3:
 
             self._bot_services[bot_id] = BotServiceV2(
                 token=bot["token"],
-                timeout=getattr(Config, 'BOT_REQUEST_TIMEOUT', 120)
+                timeout=getattr(Config, 'BOT_REQUEST_TIMEOUT', 120),
+                auto_retry_rate_limit=False
             )
 
         return self._bot_services[bot_id]
@@ -635,119 +636,129 @@ class PublisherServiceV3:
 
                     upload_items.append(upload_item)
 
-                # ESTRATÉGIA: Rotaciona bots APENAS em caso de rate limit
+                # ESTRATÉGIA: Tenta com TODOS os bots disponíveis para rate limit
                 results = None
                 used_bot_id = bot_id
                 last_error = None
 
-                # Tenta com o bot atual primeiro
-                try:
-                    results = await bot_service.send_media_group_with_thumbs(
-                        chat_id=group_id,
-                        items=upload_items,
-                        caption=caption,
-                        disable_notification=False
-                    )
+                # Se tem múltiplos bots, cria lista começando pelo bot atual
+                bots_to_try = []
+                if all_bot_services and len(all_bot_services) > 1:
+                    # Bot atual primeiro
+                    bots_to_try = [(bid, bsvc) for bid, bsvc in all_bot_services if bid == bot_id]
+                    # Depois os outros
+                    bots_to_try.extend([(bid, bsvc) for bid, bsvc in all_bot_services if bid != bot_id])
+                else:
+                    # Só tem um bot
+                    bots_to_try = [(bot_id, bot_service)]
 
-                except BotApiError as e:
-                    last_error = e
-                    error_msg = str(e).lower()
+                # Tenta com cada bot
+                for attempt_bot_id, attempt_bot_service in bots_to_try:
+                    try:
+                        results = await attempt_bot_service.send_media_group_with_thumbs(
+                            chat_id=group_id,
+                            items=upload_items,
+                            caption=caption,
+                            disable_notification=False
+                        )
+                        used_bot_id = attempt_bot_id
 
-                    # APENAS rate limit → tenta outros bots
-                    if ("too many requests" in error_msg or "429" in error_msg) and all_bot_services and len(all_bot_services) > 1:
-                        logger.warning(f"⚠️ [{model_index}]{batch_label} Rate limit no bot {bot_id}, tentando outros bots...")
+                        if attempt_bot_id != bot_id:
+                            logger.info(f"🔄 [{model_index}]{batch_label} Sucesso com bot alternativo {attempt_bot_id}")
 
-                        # Tenta com os outros bots disponíveis
-                        for attempt_bot_id, attempt_bot_service in all_bot_services:
-                            if attempt_bot_id == bot_id:
-                                continue  # Já tentou com este
+                        break  # Sucesso!
+
+                    except BotApiError as e:
+                        last_error = e
+                        error_msg = str(e).lower()
+
+                        # Se é rate limit, tenta próximo bot (SEM aguardar!)
+                        if "too many requests" in error_msg or "429" in error_msg or "rate limit" in error_msg:
+                            if len(bots_to_try) > 1 and attempt_bot_id != bots_to_try[-1][0]:
+                                logger.warning(
+                                    f"🔄 [{model_index}]{batch_label} Rate limit no bot {attempt_bot_id}, "
+                                    f"tentando próximo bot imediatamente..."
+                                )
+                                continue
+                            else:
+                                # Último bot também deu rate limit
+                                logger.warning(
+                                    f"⚠️ [{model_index}]{batch_label} Rate limit no bot {attempt_bot_id} "
+                                    f"(último bot disponível)"
+                                )
+                                # Não continua o loop, vai para o retry com backoff
+                                break
+
+                        # Timeout → ignora e vai para próximo (se houver)
+                        elif "timeout" in error_msg:
+                            logger.warning(f"⏭️ [{model_index}]{batch_label} Timeout no bot {attempt_bot_id}, ignorando...")
+                            # Se era o último bot ou só tem um, falha
+                            if len(bots_to_try) == 1 or attempt_bot_id == bots_to_try[-1][0]:
+                                raise
+                            # Senão tenta próximo
+                            continue
+
+                        # Outros erros → para imediatamente
+                        else:
+                            logger.error(f"❌ [{model_index}]{batch_label} Erro no bot {attempt_bot_id}: {e}")
+                            raise
+
+                    except asyncio.TimeoutError:
+                        logger.warning(f"⏭️ [{model_index}]{batch_label} Timeout asyncio no bot {attempt_bot_id}, ignorando...")
+                        # Se era o último bot ou só tem um, falha
+                        if len(bots_to_try) == 1 or attempt_bot_id == bots_to_try[-1][0]:
+                            raise
+                        # Senão tenta próximo
+                        continue
+
+                # Se todos os bots deram rate limit, usa retry com backoff
+                if results is None and last_error:
+                    error_msg = str(last_error).lower()
+
+                    if "too many requests" in error_msg or "429" in error_msg or "rate limit" in error_msg:
+                        logger.warning(f"🔁 [{model_index}]{batch_label} Todos os bots com rate limit, usando retry...")
+
+                        # Retry apenas para rate limit
+                        max_retries = 3
+                        retry_count = 0
+
+                        while retry_count < max_retries and results is None:
+                            retry_count += 1
+
+                            # Extrai retry_after
+                            retry_after = None
+                            if "retry after" in str(last_error).lower():
+                                import re
+                                match = re.search(r'retry after (\d+)', str(last_error).lower())
+                                if match:
+                                    retry_after = int(match.group(1))
+
+                            wait_time = (retry_after + 2) if retry_after else min(10 * (2 ** (retry_count - 1)), 60)
+
+                            logger.warning(
+                                f"⏳ [{model_index}]{batch_label} Aguardando {wait_time}s "
+                                f"(retry {retry_count}/{max_retries})"
+                            )
+
+                            await asyncio.sleep(wait_time)
 
                             try:
-                                results = await attempt_bot_service.send_media_group_with_thumbs(
+                                # Tenta com o primeiro bot disponível
+                                first_bot_id, first_bot_service = bots_to_try[0]
+                                results = await first_bot_service.send_media_group_with_thumbs(
                                     chat_id=group_id,
                                     items=upload_items,
                                     caption=caption,
                                     disable_notification=False
                                 )
-                                used_bot_id = attempt_bot_id
-                                logger.info(f"🔄 [{model_index}]{batch_label} Sucesso com bot alternativo {attempt_bot_id}")
-                                break  # Sucesso!
-
-                            except BotApiError as e2:
-                                error_msg2 = str(e2).lower()
-
-                                # Se também deu rate limit, tenta próximo
-                                if "too many requests" in error_msg2 or "429" in error_msg2:
-                                    logger.warning(f"⚠️ [{model_index}]{batch_label} Rate limit também no bot {attempt_bot_id}")
-                                    last_error = e2
-                                    continue
-                                else:
-                                    # Outros erros, para de tentar
-                                    last_error = e2
-                                    break
-
-                            except asyncio.TimeoutError:
-                                # Timeout → ignora este bot e para de tentar
-                                logger.warning(f"⚠️ [{model_index}]{batch_label} Timeout no bot {attempt_bot_id}, ignorando...")
-                                last_error = Exception("Timeout")
+                                used_bot_id = first_bot_id
+                                logger.info(f"✅ [{model_index}]{batch_label} Sucesso após retry {retry_count}")
                                 break
 
-                        # Se rotacionou por todos e ainda não tem resultado, usa retry
-                        if results is None:
-                            logger.warning(f"🔁 [{model_index}]{batch_label} Todos os bots com rate limit, usando retry...")
-
-                            # Retry apenas para rate limit
-                            max_retries = 3
-                            retry_count = 0
-
-                            while retry_count < max_retries and results is None:
-                                retry_count += 1
-
-                                # Extrai retry_after
-                                retry_after = None
-                                if "retry after" in str(last_error).lower():
-                                    import re
-                                    match = re.search(r'retry after (\d+)', str(last_error).lower())
-                                    if match:
-                                        retry_after = int(match.group(1))
-
-                                wait_time = (retry_after + 2) if retry_after else min(10 * (2 ** (retry_count - 1)), 60)
-
-                                logger.warning(
-                                    f"⏳ [{model_index}]{batch_label} Aguardando {wait_time}s "
-                                    f"(retry {retry_count}/{max_retries})"
-                                )
-
-                                await asyncio.sleep(wait_time)
-
-                                try:
-                                    # Tenta com o bot original
-                                    results = await bot_service.send_media_group_with_thumbs(
-                                        chat_id=group_id,
-                                        items=upload_items,
-                                        caption=caption,
-                                        disable_notification=False
-                                    )
-                                    used_bot_id = bot_id
-                                    logger.info(f"✅ [{model_index}]{batch_label} Sucesso após retry {retry_count}")
+                            except (BotApiError, asyncio.TimeoutError) as e3:
+                                last_error = e3
+                                if retry_count >= max_retries:
                                     break
-
-                                except (BotApiError, asyncio.TimeoutError) as e3:
-                                    last_error = e3
-                                    if retry_count >= max_retries:
-                                        break
-
-                    # Timeout ou outros erros → falha imediatamente
-                    elif "timeout" in error_msg:
-                        logger.warning(f"⏭️ [{model_index}]{batch_label} Timeout, ignorando batch e seguindo...")
-                        raise
-                    else:
-                        # Outros erros → falha imediatamente
-                        raise
-
-                except asyncio.TimeoutError:
-                    logger.warning(f"⏭️ [{model_index}]{batch_label} Timeout asyncio, ignorando batch e seguindo...")
-                    raise
 
                 # Se ainda não tem resultados, falhou completamente
                 if results is None:
@@ -803,6 +814,8 @@ class PublisherServiceV3:
                                 os.remove(path)
                             except:
                                 pass
+
+
     # =====================================================
 
     async def _process_sequential(self, group_id: int, items: List[Dict], batch_size: int):

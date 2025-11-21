@@ -22,13 +22,18 @@ class BotServiceV2:
     # Servidor local (sem limite de tamanho)
     BASE_URL = "http://154.38.174.118:9000/bot{token}/{method}"
 
-    def __init__(self, token: str, timeout: int = 120, base_url: str = None):
+    def __init__(self, token: str, timeout: int = 120, base_url: str = None, auto_retry_rate_limit: bool = True):
         self.token = token
         self.timeout = timeout
+        self.auto_retry_rate_limit = auto_retry_rate_limit
         self._session: Optional[aiohttp.ClientSession] = None
         self._rate_limit_delay = 0.05
         self._last_request_time = 0
 
+        if base_url:
+            self.base_url = base_url
+        else:
+            self.base_url = self.BASE_URL
         if base_url:
             self.base_url = base_url
         else:
@@ -353,16 +358,21 @@ class BotServiceV2:
 
                     if error_code == 429:
                         retry_after = result.get("parameters", {}).get("retry_after", 30)
-                        logger.warning(f"Rate limited. Aguardando {retry_after}s...")
-                        await asyncio.sleep(retry_after)
-                        return await self.send_media_group_with_thumbs(
-                            chat_id, items, caption, disable_notification
-                        )
+
+                        # MUDANÇA: só faz retry se auto_retry_rate_limit estiver True
+                        if self.auto_retry_rate_limit:
+                            logger.warning(f"Rate limited. Aguardando {retry_after}s...")
+                            await asyncio.sleep(retry_after)
+                            return await self.send_media_group_with_thumbs(
+                                chat_id, items, caption, disable_notification
+                            )
+                        else:
+                            # Lança exceção imediatamente para o publisher rotacionar bots
+                            raise BotApiError(f"[429] Too Many Requests: retry after {retry_after}")
 
                     raise BotApiError(f"[{error_code}] {description}")
 
                 return result.get("result", [])
-
         except aiohttp.ClientError as e:
             raise BotApiError(f"Erro de conexão: {e}")
         except asyncio.TimeoutError:
