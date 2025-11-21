@@ -683,20 +683,15 @@ class PublisherServiceV3:
                             else:
                                 # Último bot também deu rate limit
                                 logger.warning(
-                                    f"⚠️ [{model_index}]{batch_label} Rate limit no bot {attempt_bot_id} "
-                                    f"(último bot disponível)"
+                                    f"⏭️ [{model_index}]{batch_label} Rate limit no bot {attempt_bot_id} "
+                                    f"(último bot disponível) - pulando batch"
                                 )
-                                # Não continua o loop, vai para o retry com backoff
                                 break
 
                         # Timeout → ignora e vai para próximo (se houver)
                         elif "timeout" in error_msg:
-                            logger.warning(f"⏭️ [{model_index}]{batch_label} Timeout no bot {attempt_bot_id}, ignorando...")
-                            # Se era o último bot ou só tem um, falha
-                            if len(bots_to_try) == 1 or attempt_bot_id == bots_to_try[-1][0]:
-                                raise
-                            # Senão tenta próximo
-                            continue
+                            logger.warning(f"⏭️ [{model_index}]{batch_label} Timeout no bot {attempt_bot_id}, pulando batch...")
+                            raise
 
                         # Outros erros → para imediatamente
                         else:
@@ -705,27 +700,25 @@ class PublisherServiceV3:
 
                     except asyncio.TimeoutError:
                         logger.warning(f"⏭️ [{model_index}]{batch_label} Timeout asyncio no bot {attempt_bot_id}, ignorando...")
-                        # Se era o último bot ou só tem um, falha
                         if len(bots_to_try) == 1 or attempt_bot_id == bots_to_try[-1][0]:
                             raise
-                        # Senão tenta próximo
                         continue
 
-                # Se todos os bots deram rate limit, usa retry com backoff
-                if results is None and last_error:
-                    error_msg = str(last_error).lower()
+                # Se todos os bots deram rate limit, desiste
+                if results is None:
+                    error_msg = str(last_error).lower() if last_error else ""
 
                     if "too many requests" in error_msg or "429" in error_msg or "rate limit" in error_msg:
-                        logger.warning(f"🔁 [{model_index}]{batch_label} Todos os bots com rate limit, usando retry...")
+                        logger.warning(
+                            f"🔁 [{model_index}]{batch_label} Todos os bots com rate limit, "
+                            f"iniciando retry..."
+                        )
 
-                        # Retry apenas para rate limit
-                        max_retries = 3
-                        retry_count = 0
+                        # Retry com backoff: 10s, 30s, 60s
+                        retry_delays = [10, 30, 60]
 
-                        while retry_count < max_retries and results is None:
-                            retry_count += 1
-
-                            # Extrai retry_after
+                        for retry_count, wait_time in enumerate(retry_delays, start=1):
+                            # Extrai retry_after do Telegram se disponível
                             retry_after = None
                             if "retry after" in str(last_error).lower():
                                 import re
@@ -733,11 +726,13 @@ class PublisherServiceV3:
                                 if match:
                                     retry_after = int(match.group(1))
 
-                            wait_time = (retry_after + 2) if retry_after else min(10 * (2 ** (retry_count - 1)), 60)
+                            # Usa o maior entre o retry_after e o delay planejado
+                            if retry_after:
+                                wait_time = max(wait_time, retry_after + 2)
 
                             logger.warning(
                                 f"⏳ [{model_index}]{batch_label} Aguardando {wait_time}s "
-                                f"(retry {retry_count}/{max_retries})"
+                                f"(retry {retry_count}/{len(retry_delays)})"
                             )
 
                             await asyncio.sleep(wait_time)
@@ -755,15 +750,40 @@ class PublisherServiceV3:
                                 logger.info(f"✅ [{model_index}]{batch_label} Sucesso após retry {retry_count}")
                                 break
 
-                            except (BotApiError, asyncio.TimeoutError) as e3:
+                            except BotApiError as e3:
                                 last_error = e3
-                                if retry_count >= max_retries:
+                                error_msg3 = str(e3).lower()
+
+                                # Se ainda tem rate limit, continua retry
+                                if "too many requests" in error_msg3 or "429" in error_msg3 or "rate limit" in error_msg3:
+                                    if retry_count >= len(retry_delays):
+                                        logger.error(
+                                            f"❌ [{model_index}]{batch_label} Rate limit persistente "
+                                            f"após {len(retry_delays)} retries"
+                                        )
+                                        break
+                                    # Atualiza retry_after para próxima tentativa
+                                    continue
+                                else:
+                                    # Outro erro, para
+                                    logger.error(f"❌ [{model_index}]{batch_label} Erro diferente no retry: {e3}")
                                     break
 
-                # Se ainda não tem resultados, falhou completamente
-                if results is None:
-                    raise last_error or Exception("Falha após tentar todos os bots")
+                            except asyncio.TimeoutError:
+                                logger.warning(f"⏭️ [{model_index}]{batch_label} Timeout no retry, parando...")
+                                last_error = Exception("Timeout")
+                                break
 
+                        # Se ainda não tem resultado após todos os retries
+                        if results is None:
+                            logger.error(
+                                f"❌ [{model_index}]{batch_label} Falhou após todos os retries, "
+                                f"pulando batch..."
+                            )
+                            raise last_error or Exception("Todos os bots com rate limit após retries")
+                    else:
+                        # Outro tipo de erro
+                        raise last_error or Exception("Falha após tentar todos os bots")
                 # Registra publicações
                 processed = 0
                 for i, result in enumerate(results):
