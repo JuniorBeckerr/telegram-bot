@@ -1,24 +1,35 @@
 """
-Comando para atualizar catálogo de modelos no Telegram
+Comando para criar ou atualizar catálogo de modelos no Telegram
 
-Atualiza 3 mensagens fixas no Telegram com lista alfabética de modelos publicadas:
+Modos de operação:
+1. CRIAR (primeira execução): Cria 3 mensagens fixas e retorna seus IDs
+2. ATUALIZAR (execuções seguintes): Atualiza mensagens existentes por seus IDs
+
+Mensagens:
 - Mensagem 1: A-H
 - Mensagem 2: I-P
 - Mensagem 3: Q-Z
 
 Uso:
-    python update_models_catalog.py <chat_id> <message_id_ah> <message_id_ip> <message_id_qz> [--bot_token=TOKEN]
+    # Criar mensagens (primeira vez)
+    python update_models_catalog.py <chat_id> --create [--bot_token=TOKEN]
 
-Exemplo:
-    python update_models_catalog.py -1003391602003 668 669 670
-    python update_models_catalog.py -1003391602003 668 669 670 --bot_token=123456:ABC-DEF
+    # Atualizar mensagens existentes
+    python update_models_catalog.py <chat_id> --message_id_ah=668 --message_id_ip=669 --message_id_qz=670 [--bot_token=TOKEN]
+
+Exemplos:
+    # Criar mensagens iniciais
+    python update_models_catalog.py -1003391602003 --create
+
+    # Atualizar mensagens existentes
+    python update_models_catalog.py -1003391602003 --message_id_ah=668 --message_id_ip=669 --message_id_qz=670
 """
 
 import argparse
 import logging
 import sys
 import os
-from typing import List, Dict
+from typing import List, Dict, Optional
 from collections import defaultdict
 from datetime import datetime
 
@@ -38,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 
 class UpdateModelsCatalog:
-    """Classe para atualizar catálogo de modelos no Telegram"""
+    """Classe para criar ou atualizar catálogo de modelos no Telegram"""
 
     def __init__(self, bot_token: str):
         self.models_repo = ModelsRepository()
@@ -194,6 +205,85 @@ class UpdateModelsCatalog:
 
         return message
 
+    async def create_catalog(self, chat_id: int) -> Dict[str, any]:
+        """
+        Cria o catálogo completo no Telegram (primeira vez)
+
+        Args:
+            chat_id: ID do chat/grupo
+
+        Returns:
+            Dicionário com estatísticas da operação e IDs das mensagens criadas
+        """
+        stats = {
+            'total_models': 0,
+            'groups': {},
+            'created': 0,
+            'errors': 0,
+            'message_ids': {}
+        }
+
+        try:
+            # 1. Busca modelos publicados
+            logger.info("=" * 60)
+            models = self.get_published_models()
+            stats['total_models'] = len(models)
+
+            if not models:
+                logger.warning("Nenhum modelo encontrado para criar catálogo")
+                return stats
+
+            # 2. Agrupa por faixa de letras
+            grouped_models = self.group_models_by_letter_range(models)
+
+            logger.info("=" * 60)
+            logger.info("DISTRIBUIÇÃO DOS MODELOS:")
+            for group, model_list in grouped_models.items():
+                stats['groups'][group] = len(model_list)
+                logger.info(f"  {group}: {len(model_list)} modelo(s)")
+
+            # 3. Cria cada mensagem
+            logger.info("=" * 60)
+            logger.info("CRIANDO MENSAGENS NO TELEGRAM:")
+
+            for letter_range in ['A-H', 'I-P', 'Q-Z']:
+                model_list = grouped_models.get(letter_range, [])
+
+                # Formata mensagem
+                message_text = self.format_message(letter_range, model_list)
+
+                # Cria no Telegram
+                message_id = await self.send_message(
+                    chat_id=chat_id,
+                    text=message_text
+                )
+
+                if message_id:
+                    logger.info(f"  ✓ {letter_range} criado (msg_id={message_id})")
+                    stats['created'] += 1
+                    stats['message_ids'][letter_range] = message_id
+
+                    # Tenta fixar a mensagem
+                    pinned = await self.pin_message(chat_id, message_id)
+                    if pinned:
+                        logger.info(f"    → Mensagem fixada com sucesso")
+                    else:
+                        logger.warning(f"    → Não foi possível fixar a mensagem")
+                else:
+                    logger.error(f"  ✗ Falha ao criar {letter_range}")
+                    stats['errors'] += 1
+
+            return stats
+
+        except Exception as e:
+            logger.error(f"Erro ao criar catálogo: {e}", exc_info=True)
+            stats['errors'] += 1
+            return stats
+        finally:
+            # Fecha conexão do bot service
+            if self.bot_service:
+                await self.bot_service.close()
+
     async def update_catalog(
             self,
             chat_id: int,
@@ -275,6 +365,62 @@ class UpdateModelsCatalog:
             if self.bot_service:
                 await self.bot_service.close()
 
+    async def send_message(self, chat_id: int, text: str) -> Optional[int]:
+        """
+        Envia uma nova mensagem no Telegram
+
+        Args:
+            chat_id: ID do chat
+            text: Texto da mensagem
+
+        Returns:
+            ID da mensagem criada ou None se erro
+        """
+        try:
+            if not self.bot_service:
+                self.bot_service = BotServiceV2(token=self.bot_token)
+
+            response = await self.bot_service._request(
+                "sendMessage",
+                chat_id=chat_id,
+                text=text,
+                parse_mode="Markdown"
+            )
+
+            return response.get('message_id')
+
+        except Exception as e:
+            logger.error(f"Erro ao enviar mensagem: {e}")
+            return None
+
+    async def pin_message(self, chat_id: int, message_id: int) -> bool:
+        """
+        Fixa uma mensagem no chat
+
+        Args:
+            chat_id: ID do chat
+            message_id: ID da mensagem a fixar
+
+        Returns:
+            True se sucesso, False se erro
+        """
+        try:
+            if not self.bot_service:
+                self.bot_service = BotServiceV2(token=self.bot_token)
+
+            await self.bot_service._request(
+                "pinChatMessage",
+                chat_id=chat_id,
+                message_id=message_id,
+                disable_notification=True
+            )
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Erro ao fixar mensagem {message_id}: {e}")
+            return False
+
     async def edit_message(self, chat_id: int, message_id: int, text: str) -> bool:
         """
         Edita uma mensagem existente (não cria nova)
@@ -311,57 +457,106 @@ async def async_main(args):
     """Função principal assíncrona"""
 
     # Validações
-    bot_token = "8541185101:AAGqEe1nxmD9HXlbz8ATx27YC3hU79FEbKQ"
+    bot_token = args.bot_token or os.getenv("TELEGRAM_BOT_TOKEN") or "8541185101:AAGqEe1nxmD9HXlbz8ATx27YC3hU79FEbKQ"
     if not bot_token:
         logger.error("Bot token não fornecido. Use --bot_token ou configure TELEGRAM_BOT_TOKEN")
         sys.exit(1)
 
-    message_ids = {
-        'A-H': args.message_id_ah,
-        'I-P': args.message_id_ip,
-        'Q-Z': args.message_id_qz
-    }
-
     # Log dos parâmetros
     logger.info("=" * 60)
-    logger.info("ATUALIZANDO CATÁLOGO DE MODELOS NO TELEGRAM")
+    if args.create:
+        logger.info("CRIANDO CATÁLOGO DE MODELOS NO TELEGRAM")
+    else:
+        logger.info("ATUALIZANDO CATÁLOGO DE MODELOS NO TELEGRAM")
     logger.info("=" * 60)
     logger.info(f"Chat ID: {args.chat_id}")
-    logger.info(f"Message ID A-H: {message_ids['A-H']}")
-    logger.info(f"Message ID I-P: {message_ids['I-P']}")
-    logger.info(f"Message ID Q-Z: {message_ids['Q-Z']}")
+
+    if not args.create:
+        logger.info(f"Message ID A-H: {args.message_id_ah}")
+        logger.info(f"Message ID I-P: {args.message_id_ip}")
+        logger.info(f"Message ID Q-Z: {args.message_id_qz}")
+
     logger.info("=" * 60)
 
     try:
-        # Executa atualização
         updater = UpdateModelsCatalog(bot_token)
-        stats = await updater.update_catalog(
-            chat_id=args.chat_id,
-            message_ids=message_ids
-        )
 
-        # Exibe resultado
-        logger.info("=" * 60)
-        logger.info("RESUMO DA OPERAÇÃO")
-        logger.info("=" * 60)
-        logger.info(f"Total de modelos encontrados: {stats['total_models']}")
+        if args.create:
+            # Modo criação
+            stats = await updater.create_catalog(chat_id=args.chat_id)
 
-        for group, count in stats['groups'].items():
-            logger.info(f"  {group}: {count} modelo(s)")
+            # Exibe resultado
+            logger.info("=" * 60)
+            logger.info("RESUMO DA OPERAÇÃO - CRIAÇÃO")
+            logger.info("=" * 60)
+            logger.info(f"Total de modelos encontrados: {stats['total_models']}")
 
-        logger.info(f"\nMensagens atualizadas: {stats['updated']}/3")
-        logger.info(f"Erros: {stats['errors']}")
-        logger.info("=" * 60)
+            for group, count in stats['groups'].items():
+                logger.info(f"  {group}: {count} modelo(s)")
 
-        if stats['errors'] > 0:
-            logger.warning("A operação foi concluída com erros. Verifique os logs acima.")
-            sys.exit(1)
+            logger.info(f"\nMensagens criadas: {stats['created']}/3")
+            logger.info(f"Erros: {stats['errors']}")
 
-        if stats['updated'] == 0:
-            logger.warning("Nenhuma mensagem foi atualizada.")
-            sys.exit(1)
+            if stats['message_ids']:
+                logger.info("\n📝 IDs DAS MENSAGENS CRIADAS (salve para próximas atualizações):")
+                logger.info("=" * 60)
+                for letter_range in ['A-H', 'I-P', 'Q-Z']:
+                    msg_id = stats['message_ids'].get(letter_range, 'N/A')
+                    logger.info(f"  {letter_range}: {msg_id}")
+                logger.info("\n💡 Use estes IDs no próximo comando:")
+                logger.info(f"  python update_models_catalog.py {args.chat_id} \\")
+                logger.info(f"    --message_id_ah={stats['message_ids'].get('A-H', 'XXX')} \\")
+                logger.info(f"    --message_id_ip={stats['message_ids'].get('I-P', 'XXX')} \\")
+                logger.info(f"    --message_id_qz={stats['message_ids'].get('Q-Z', 'XXX')}")
 
-        logger.info("✅ Catálogo atualizado com sucesso!")
+            logger.info("=" * 60)
+
+            if stats['errors'] > 0:
+                logger.warning("A operação foi concluída com erros. Verifique os logs acima.")
+                sys.exit(1)
+
+            if stats['created'] == 0:
+                logger.warning("Nenhuma mensagem foi criada.")
+                sys.exit(1)
+
+            logger.info("✅ Catálogo criado com sucesso!")
+
+        else:
+            # Modo atualização
+            message_ids = {
+                'A-H': args.message_id_ah,
+                'I-P': args.message_id_ip,
+                'Q-Z': args.message_id_qz
+            }
+
+            stats = await updater.update_catalog(
+                chat_id=args.chat_id,
+                message_ids=message_ids
+            )
+
+            # Exibe resultado
+            logger.info("=" * 60)
+            logger.info("RESUMO DA OPERAÇÃO - ATUALIZAÇÃO")
+            logger.info("=" * 60)
+            logger.info(f"Total de modelos encontrados: {stats['total_models']}")
+
+            for group, count in stats['groups'].items():
+                logger.info(f"  {group}: {count} modelo(s)")
+
+            logger.info(f"\nMensagens atualizadas: {stats['updated']}/3")
+            logger.info(f"Erros: {stats['errors']}")
+            logger.info("=" * 60)
+
+            if stats['errors'] > 0:
+                logger.warning("A operação foi concluída com erros. Verifique os logs acima.")
+                sys.exit(1)
+
+            if stats['updated'] == 0:
+                logger.warning("Nenhuma mensagem foi atualizada.")
+                sys.exit(1)
+
+            logger.info("✅ Catálogo atualizado com sucesso!")
+
         sys.exit(0)
 
     except KeyboardInterrupt:
@@ -375,40 +570,54 @@ async def async_main(args):
 def main():
     """Função principal do comando"""
     parser = argparse.ArgumentParser(
-        description='Atualiza catálogo de modelos em mensagens do Telegram',
+        description='Cria ou atualiza catálogo de modelos em mensagens do Telegram',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemplos de uso:
-  python update_models_catalog.py -1003391602003 668 669 670
-  python update_models_catalog.py -1003391602003 668 669 670 --bot_token=123456:ABC-DEF
+
+  1. CRIAR mensagens (primeira vez):
+     python update_models_catalog.py -1003391602003 --create
+     
+  2. ATUALIZAR mensagens existentes:
+     python update_models_catalog.py -1003391602003 \\
+       --message_id_ah=668 --message_id_ip=669 --message_id_qz=670
 
 O script busca modelos que têm mídias publicadas (status='completed' em publish_queue)
-e atualiza 3 mensagens fixas no Telegram com a lista ordenada alfabeticamente.
+e cria ou atualiza 3 mensagens fixas no Telegram com a lista ordenada alfabeticamente.
         """
     )
 
     parser.add_argument(
         'chat_id',
         type=int,
-        help='ID do chat/grupo do Telegram onde estão as mensagens'
+        help='ID do chat/grupo do Telegram'
     )
 
     parser.add_argument(
-        'message_id_ah',
-        type=int,
-        help='ID da mensagem para modelos A-H'
+        '--create',
+        action='store_true',
+        help='Cria as mensagens iniciais (primeira execução)'
     )
 
     parser.add_argument(
-        'message_id_ip',
+        '--message_id_ah',
         type=int,
-        help='ID da mensagem para modelos I-P'
+        default=None,
+        help='ID da mensagem para modelos A-H (obrigatório se não usar --create)'
     )
 
     parser.add_argument(
-        'message_id_qz',
+        '--message_id_ip',
         type=int,
-        help='ID da mensagem para modelos Q-Z'
+        default=None,
+        help='ID da mensagem para modelos I-P (obrigatório se não usar --create)'
+    )
+
+    parser.add_argument(
+        '--message_id_qz',
+        type=int,
+        default=None,
+        help='ID da mensagem para modelos Q-Z (obrigatório se não usar --create)'
     )
 
     parser.add_argument(
@@ -420,6 +629,11 @@ e atualiza 3 mensagens fixas no Telegram com a lista ordenada alfabeticamente.
 
     args = parser.parse_args()
 
+    # Validações
+    if not args.create:
+        if not all([args.message_id_ah, args.message_id_ip, args.message_id_qz]):
+            parser.error("Quando não usar --create, todos os message_ids são obrigatórios (--message_id_ah, --message_id_ip, --message_id_qz)")
+
     # Executa de forma assíncrona
     asyncio.run(async_main(args))
 
@@ -427,4 +641,10 @@ e atualiza 3 mensagens fixas no Telegram com a lista ordenada alfabeticamente.
 if __name__ == "__main__":
     main()
 
-# python -m syncs.update_models_catalog -1003391602003 668 669 670
+# EXEMPLOS DE USO:
+#
+# Criar mensagens (primeira vez):
+# python -m syncs.update_models_catalog -1003391602003 --create
+#
+# Atualizar mensagens existentes:
+# python -m syncs.update_models_catalog -1003391602003 --message_id_ah=668 --message_id_ip=669 --message_id_qz=670
