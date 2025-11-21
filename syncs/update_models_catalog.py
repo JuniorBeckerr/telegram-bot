@@ -1,0 +1,472 @@
+"""
+Comando para atualizar catálogo de modelos no Telegram
+
+Atualiza 3 mensagens fixas no Telegram com lista alfabética de modelos publicadas:
+- Mensagem 1: A-H
+- Mensagem 2: I-P
+- Mensagem 3: Q-Z
+
+Uso:
+    python update_models_catalog.py <chat_id> <message_id_ah> <message_id_ip> <message_id_qz> [--bot_token=TOKEN]
+
+Exemplo:
+    python update_models_catalog.py -1003391602003 123 124 125
+    python update_models_catalog.py -1003391602003 123 124 125 --bot_token=123456:ABC-DEF
+"""
+
+import argparse
+import logging
+import sys
+import os
+from typing import List, Dict
+from collections import defaultdict
+from datetime import datetime
+
+from app.repository.models_repository import ModelsRepository
+from app.repository.media_classifications_repository import MediaClassificationsRepository
+from app.repository.publish_queue_repository import PublishQueueRepository
+from app.services.bot_service import BotServiceV2, BotApiError
+
+import asyncio
+
+# Configurar logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class UpdateModelsCatalog:
+    """Classe para atualizar catálogo de modelos no Telegram"""
+
+    def __init__(self, bot_token: str):
+        self.models_repo = ModelsRepository()
+        self.classification_repo = MediaClassificationsRepository()
+        self.queue_repo = PublishQueueRepository()
+        self.bot_token = bot_token
+        self.bot_service = None
+
+    def escape_model_name(self, name: str) -> str:
+        """Escapa apenas caracteres que quebram Markdown nos nomes das modelos."""
+        return name.replace("_", "\\_").replace("*", "\\*")
+
+    def get_published_models(self) -> List[str]:
+        """
+        Busca modelos que têm publicações completadas
+
+        Lógica:
+        1. Busca registros de publish_queue com status='completed'
+        2. Pega os media_ids dessas publicações
+        3. Busca model_ids através de media_classifications
+        4. Busca stage_names dos modelos
+        5. Retorna lista única ordenada alfabeticamente
+
+        Returns:
+            Lista de stage_names únicos em ordem alfabética
+        """
+        logger.info("Buscando modelos com publicações completadas...")
+
+        # 1. Busca publicações completadas
+        completed_queue = (
+            self.queue_repo
+            .where("status", "completed")
+            .get()
+        )
+
+        if not completed_queue:
+            logger.warning("Nenhuma publicação completada encontrada")
+            return []
+
+        logger.info(f"Encontradas {len(completed_queue)} publicações completadas")
+
+        # 2. Extrai media_ids únicos
+        media_ids = list(set([item['media_id'] for item in completed_queue]))
+        logger.info(f"Total de {len(media_ids)} mídias únicas publicadas")
+
+        # 3. Busca classificações para essas mídias
+        classifications = (
+            self.classification_repo.query()
+            .where_in("media_id", media_ids)
+            .get()
+        )
+
+        if not classifications:
+            logger.warning("Nenhuma classificação encontrada para as mídias publicadas")
+            return []
+
+        logger.info(f"Encontradas {len(classifications)} classificações")
+
+        # 4. Extrai model_ids únicos
+        model_ids = list(set([c['model_id'] for c in classifications]))
+        logger.info(f"Total de {len(model_ids)} modelos classificados")
+
+        # 5. Busca stage_names dos modelos
+        models = (
+            self.models_repo.query()
+            .where_in("id", model_ids)
+            .where_not_null("stage_name")
+            .get()
+        )
+
+        if not models:
+            logger.warning("Nenhum modelo encontrado com stage_name")
+            return []
+
+        # 6. Extrai e ordena stage_names
+        stage_names = sorted(list(set([m['stage_name'] for m in models])))
+
+        logger.info(f"✓ Total de {len(stage_names)} modelos únicos para publicar no catálogo")
+
+        return stage_names
+
+    def group_models_by_letter_range(self, models: List[str]) -> Dict[str, List[str]]:
+        """
+        Agrupa modelos por faixa de letras (A-H, I-P, Q-Z)
+
+        Args:
+            models: Lista de stage_names
+
+        Returns:
+            Dicionário com grupos {range: [models]}
+        """
+        groups = {
+            'A-H': [],
+            'I-P': [],
+            'Q-Z': []
+        }
+
+        for model in models:
+            if not model:
+                continue
+
+            first_char = model[0].upper()
+
+            if 'A' <= first_char <= 'H':
+                groups['A-H'].append(model)
+            elif 'I' <= first_char <= 'P':
+                groups['I-P'].append(model)
+            elif 'Q' <= first_char <= 'Z':
+                groups['Q-Z'].append(model)
+            else:
+                # Números ou caracteres especiais vão para Q-Z
+                groups['Q-Z'].append(model)
+
+        return groups
+
+    def format_message(self, letter_range: str, models: List[str]) -> str:
+        """
+        Formata a mensagem para o Telegram
+
+        Args:
+            letter_range: Faixa de letras (ex: "A-H")
+            models: Lista de stage_names
+
+        Returns:
+            String formatada em Markdown
+        """
+        if not models:
+            return (
+                f"📋 **CATÁLOGO DE MODELOS ({letter_range})**\n\n"
+                f"_Nenhum modelo disponível nesta categoria._\n\n"
+                f"🕐 Atualizado em: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+            )
+
+        # Header
+        message = f"📋 CATÁLOGO DE MODELOS {letter_range}\n"
+        message += f"_Total: {len(models)} modelo{'s' if len(models) != 1 else ''}_\n\n"
+
+        # Agrupa por letra inicial
+        by_letter = defaultdict(list)
+        for model in sorted(models):
+            letter = model[0].upper()
+            by_letter[letter].append(model)
+
+        # Formata por letra
+        for letter in sorted(by_letter.keys()):
+            message += f"**{letter}**\n"
+            for model in sorted(by_letter[letter]):
+                message += f"  #{self.escape_model_name(model)}\n"
+            message += "\n"
+
+        # Footer
+        message += f"🕐 Atualizado em: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+
+        return message
+
+    async def update_telegram_message(
+            self,
+            chat_id: int,
+            message_id: int,
+            text: str
+    ) -> bool:
+        """
+        Atualiza uma mensagem específica no Telegram usando BotServiceV2
+
+        Args:
+            chat_id: ID do chat/grupo
+            message_id: ID da mensagem a ser editada
+            text: Novo texto da mensagem
+
+        Returns:
+            True se sucesso, False se erro
+        """
+        try:
+            if not self.bot_service:
+                self.bot_service = BotServiceV2(token=self.bot_token)
+
+            # Usa editMessageText via _request
+            await self.bot_service._request(
+                "editMessageText",
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode="Markdown"
+            )
+
+            return True
+
+        except BotApiError as e:
+            logger.error(f"Erro ao atualizar mensagem {message_id}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Erro inesperado ao atualizar mensagem {message_id}: {e}")
+            return False
+
+    async def update_catalog(
+            self,
+            chat_id: int,
+            message_ids: Dict[str, int]
+    ) -> Dict[str, any]:
+        """
+        Atualiza o catálogo completo no Telegram
+
+        Args:
+            chat_id: ID do chat/grupo
+            message_ids: Dict com IDs das mensagens {'A-H': 123, 'I-P': 124, 'Q-Z': 125}
+
+        Returns:
+            Dicionário com estatísticas da operação
+        """
+        stats = {
+            'total_models': 0,
+            'groups': {},
+            'updated': 0,
+            'errors': 0
+        }
+
+        try:
+            # 1. Busca modelos publicados
+            logger.info("=" * 60)
+            models = self.get_published_models()
+            stats['total_models'] = len(models)
+
+            if not models:
+                logger.warning("Nenhum modelo encontrado para atualizar")
+                return stats
+
+            # 2. Agrupa por faixa de letras
+            grouped_models = self.group_models_by_letter_range(models)
+
+            logger.info("=" * 60)
+            logger.info("DISTRIBUIÇÃO DOS MODELOS:")
+            for group, model_list in grouped_models.items():
+                stats['groups'][group] = len(model_list)
+                logger.info(f"  {group}: {len(model_list)} modelo(s)")
+
+            # 3. Atualiza cada mensagem
+            logger.info("=" * 60)
+            logger.info("ATUALIZANDO MENSAGENS NO TELEGRAM:")
+
+            for letter_range, model_list in grouped_models.items():
+                message_id = message_ids.get(letter_range)
+
+                if not message_id:
+                    logger.warning(f"  ⚠ Message ID não fornecido para {letter_range}")
+                    stats['errors'] += 1
+                    continue
+
+                # Formata mensagem
+                message_text = self.format_message(letter_range, model_list)
+
+                # Atualiza no Telegram
+                result = await self.send_or_edit_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=message_text
+                )
+
+                if result and "message_id" in result:
+                    new_id = result["message_id"]
+                    message_ids[letter_range] = new_id
+                    logger.info(f"  ✓ {letter_range} atualizado (novo msg_id={new_id})")
+                    stats['updated'] += 1
+                else:
+                    logger.error(f"  ✗ Falha ao atualizar {letter_range} (msg_id={message_id})")
+                    stats['errors'] += 1
+
+            return stats
+
+        except Exception as e:
+            logger.error(f"Erro ao atualizar catálogo: {e}", exc_info=True)
+            stats['errors'] += 1
+            return stats
+        finally:
+            # Fecha conexão do bot service
+            if self.bot_service:
+                await self.bot_service.close()
+
+    async def send_or_edit_message(self, chat_id: int, message_id: int, text: str):
+        """Tenta editar, e se falhar, cria nova mensagem"""
+        try:
+            if not self.bot_service:
+                self.bot_service = BotServiceV2(token=self.bot_token)
+
+            # Tenta editar
+            return await self.bot_service._request(
+                "editMessageText",
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode="Markdown"
+            )
+        except:
+            pass  # falhou ao editar → tenta criar nova
+
+        try:
+            # Envia nova mensagem
+            result = await self.bot_service._request(
+                "sendMessage",
+                chat_id=chat_id,
+                text=text,
+                parse_mode="Markdown"
+            )
+
+            # Retorna novo message_id
+            return result
+        except Exception as e:
+            logger.error(f"Erro ao enviar nova mensagem: {e}")
+            return None
+
+
+async def async_main(args):
+    """Função principal assíncrona"""
+
+    # Validações
+    bot_token = "8541185101:AAGqEe1nxmD9HXlbz8ATx27YC3hU79FEbKQ"
+    if not bot_token:
+        logger.error("Bot token não fornecido. Use --bot_token ou configure TELEGRAM_BOT_TOKEN")
+        sys.exit(1)
+
+    message_ids = {
+        'A-H': args.message_id_ah,
+        'I-P': args.message_id_ip,
+        'Q-Z': args.message_id_qz
+    }
+
+    # Log dos parâmetros
+    logger.info("=" * 60)
+    logger.info("ATUALIZANDO CATÁLOGO DE MODELOS NO TELEGRAM")
+    logger.info("=" * 60)
+    logger.info(f"Chat ID: {args.chat_id}")
+    logger.info(f"Message ID A-H: {message_ids['A-H']}")
+    logger.info(f"Message ID I-P: {message_ids['I-P']}")
+    logger.info(f"Message ID Q-Z: {message_ids['Q-Z']}")
+    logger.info("=" * 60)
+
+    try:
+        # Executa atualização
+        updater = UpdateModelsCatalog(bot_token)
+        stats = await updater.update_catalog(
+            chat_id=args.chat_id,
+            message_ids=message_ids
+        )
+
+        # Exibe resultado
+        logger.info("=" * 60)
+        logger.info("RESUMO DA OPERAÇÃO")
+        logger.info("=" * 60)
+        logger.info(f"Total de modelos encontrados: {stats['total_models']}")
+
+        for group, count in stats['groups'].items():
+            logger.info(f"  {group}: {count} modelo(s)")
+
+        logger.info(f"\nMensagens atualizadas: {stats['updated']}/3")
+        logger.info(f"Erros: {stats['errors']}")
+        logger.info("=" * 60)
+
+        if stats['errors'] > 0:
+            logger.warning("A operação foi concluída com erros. Verifique os logs acima.")
+            sys.exit(1)
+
+        if stats['updated'] == 0:
+            logger.warning("Nenhuma mensagem foi atualizada.")
+            sys.exit(1)
+
+        logger.info("✅ Catálogo atualizado com sucesso!")
+        sys.exit(0)
+
+    except KeyboardInterrupt:
+        logger.warning("\nOperação cancelada pelo usuário")
+        sys.exit(130)
+    except Exception as e:
+        logger.error(f"Erro fatal: {e}", exc_info=True)
+        sys.exit(1)
+
+
+def main():
+    """Função principal do comando"""
+    parser = argparse.ArgumentParser(
+        description='Atualiza catálogo de modelos em mensagens do Telegram',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Exemplos de uso:
+  python update_models_catalog.py -1003391602003 123 124 125
+  python update_models_catalog.py -1003391602003 123 124 125 --bot_token=123456:ABC-DEF
+
+O script busca modelos que têm mídias publicadas (status='completed' em publish_queue)
+e atualiza 3 mensagens fixas no Telegram com a lista ordenada alfabeticamente.
+        """
+    )
+
+    parser.add_argument(
+        'chat_id',
+        type=int,
+        help='ID do chat/grupo do Telegram onde estão as mensagens'
+    )
+
+    parser.add_argument(
+        'message_id_ah',
+        type=int,
+        help='ID da mensagem para modelos A-H'
+    )
+
+    parser.add_argument(
+        'message_id_ip',
+        type=int,
+        help='ID da mensagem para modelos I-P'
+    )
+
+    parser.add_argument(
+        'message_id_qz',
+        type=int,
+        help='ID da mensagem para modelos Q-Z'
+    )
+
+    parser.add_argument(
+        '--bot_token',
+        type=str,
+        default=None,
+        help='Token do bot do Telegram (ou use a variável TELEGRAM_BOT_TOKEN)'
+    )
+
+    args = parser.parse_args()
+
+    # Executa de forma assíncrona
+    asyncio.run(async_main(args))
+
+
+if __name__ == "__main__":
+    main()
+
+# python -m syncs.update_models_catalog -1003391602003 "462" "463" "464"

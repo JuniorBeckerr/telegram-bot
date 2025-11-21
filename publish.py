@@ -198,3 +198,5 @@ Exemplos:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+    # python publish.py --download-workers 18 --model-workers 6 --thumb-workers 8 --limit 10
