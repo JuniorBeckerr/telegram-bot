@@ -698,6 +698,7 @@ class PublisherServiceV3:
                                     data["item"]["id"],
                                     f"Timeout ao enviar"
                                 )
+                            self.stats_repo.increment_published(group_id)
 
                             return 0, len(ready_items)
 
@@ -715,6 +716,7 @@ class PublisherServiceV3:
                                 data["item"]["id"],
                                 f"Timeout asyncio"
                             )
+                        self.stats_repo.increment_published(group_id)
 
                         return 0, len(ready_items)
 
