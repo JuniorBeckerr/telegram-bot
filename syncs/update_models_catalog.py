@@ -647,4 +647,4 @@ if __name__ == "__main__":
 # python -m syncs.update_models_catalog -1003391602003 --create
 #
 # Atualizar mensagens existentes:
-# python -m syncs.update_models_catalog -1003391602003 --message_id_ah=668 --message_id_ip=669 --message_id_qz=670
+# python -m syncs.update_models_catalog -1003391602003 --message_id_ah=1058 --message_id_ip=1060 --message_id_qz=1062

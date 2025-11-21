@@ -347,8 +347,9 @@ class BotServiceV2:
             data.add_field("media", json.dumps(media_list))
 
             logger.debug(f"📤 Enviando álbum com {len(items)} mídias")
+            timeout = aiohttp.ClientTimeout(total=30)
 
-            async with session.post(url, data=data) as response:
+            async with session.post(url, data=data, timeout=timeout) as response:
                 self._last_request_time = time.time()
                 result = await response.json()
 
