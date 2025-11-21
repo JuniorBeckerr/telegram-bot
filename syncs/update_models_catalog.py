@@ -10,8 +10,8 @@ Uso:
     python update_models_catalog.py <chat_id> <message_id_ah> <message_id_ip> <message_id_qz> [--bot_token=TOKEN]
 
 Exemplo:
-    python update_models_catalog.py -1003391602003 123 124 125
-    python update_models_catalog.py -1003391602003 123 124 125 --bot_token=123456:ABC-DEF
+    python update_models_catalog.py -1003391602003 668 669 670
+    python update_models_catalog.py -1003391602003 668 669 670 --bot_token=123456:ABC-DEF
 """
 
 import argparse
@@ -194,45 +194,6 @@ class UpdateModelsCatalog:
 
         return message
 
-    async def update_telegram_message(
-            self,
-            chat_id: int,
-            message_id: int,
-            text: str
-    ) -> bool:
-        """
-        Atualiza uma mensagem específica no Telegram usando BotServiceV2
-
-        Args:
-            chat_id: ID do chat/grupo
-            message_id: ID da mensagem a ser editada
-            text: Novo texto da mensagem
-
-        Returns:
-            True se sucesso, False se erro
-        """
-        try:
-            if not self.bot_service:
-                self.bot_service = BotServiceV2(token=self.bot_token)
-
-            # Usa editMessageText via _request
-            await self.bot_service._request(
-                "editMessageText",
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-                parse_mode="Markdown"
-            )
-
-            return True
-
-        except BotApiError as e:
-            logger.error(f"Erro ao atualizar mensagem {message_id}: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Erro inesperado ao atualizar mensagem {message_id}: {e}")
-            return False
-
     async def update_catalog(
             self,
             chat_id: int,
@@ -289,17 +250,15 @@ class UpdateModelsCatalog:
                 # Formata mensagem
                 message_text = self.format_message(letter_range, model_list)
 
-                # Atualiza no Telegram
-                result = await self.send_or_edit_message(
+                # Atualiza no Telegram (apenas edita, não cria nova)
+                success = await self.edit_message(
                     chat_id=chat_id,
                     message_id=message_id,
                     text=message_text
                 )
 
-                if result and "message_id" in result:
-                    new_id = result["message_id"]
-                    message_ids[letter_range] = new_id
-                    logger.info(f"  ✓ {letter_range} atualizado (novo msg_id={new_id})")
+                if success:
+                    logger.info(f"  ✓ {letter_range} atualizado (msg_id={message_id})")
                     stats['updated'] += 1
                 else:
                     logger.error(f"  ✗ Falha ao atualizar {letter_range} (msg_id={message_id})")
@@ -316,37 +275,36 @@ class UpdateModelsCatalog:
             if self.bot_service:
                 await self.bot_service.close()
 
-    async def send_or_edit_message(self, chat_id: int, message_id: int, text: str):
-        """Tenta editar, e se falhar, cria nova mensagem"""
+    async def edit_message(self, chat_id: int, message_id: int, text: str) -> bool:
+        """
+        Edita uma mensagem existente (não cria nova)
+
+        Args:
+            chat_id: ID do chat
+            message_id: ID da mensagem a editar
+            text: Novo texto
+
+        Returns:
+            True se sucesso, False se erro
+        """
         try:
             if not self.bot_service:
                 self.bot_service = BotServiceV2(token=self.bot_token)
 
-            # Tenta editar
-            return await self.bot_service._request(
+            # Apenas edita a mensagem existente
+            await self.bot_service._request(
                 "editMessageText",
                 chat_id=chat_id,
                 message_id=message_id,
                 text=text,
                 parse_mode="Markdown"
             )
-        except:
-            pass  # falhou ao editar → tenta criar nova
 
-        try:
-            # Envia nova mensagem
-            result = await self.bot_service._request(
-                "sendMessage",
-                chat_id=chat_id,
-                text=text,
-                parse_mode="Markdown"
-            )
+            return True
 
-            # Retorna novo message_id
-            return result
         except Exception as e:
-            logger.error(f"Erro ao enviar nova mensagem: {e}")
-            return None
+            logger.error(f"Erro ao editar mensagem {message_id}: {e}")
+            return False
 
 
 async def async_main(args):
@@ -421,8 +379,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemplos de uso:
-  python update_models_catalog.py -1003391602003 123 124 125
-  python update_models_catalog.py -1003391602003 123 124 125 --bot_token=123456:ABC-DEF
+  python update_models_catalog.py -1003391602003 668 669 670
+  python update_models_catalog.py -1003391602003 668 669 670 --bot_token=123456:ABC-DEF
 
 O script busca modelos que têm mídias publicadas (status='completed' em publish_queue)
 e atualiza 3 mensagens fixas no Telegram com a lista ordenada alfabeticamente.
@@ -469,4 +427,4 @@ e atualiza 3 mensagens fixas no Telegram com a lista ordenada alfabeticamente.
 if __name__ == "__main__":
     main()
 
-# python -m syncs.update_models_catalog -1003391602003 "462" "463" "464"
+# python -m syncs.update_models_catalog -1003391602003 668 669 670
