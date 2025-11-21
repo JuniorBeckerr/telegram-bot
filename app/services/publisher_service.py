@@ -691,6 +691,14 @@ class PublisherServiceV3:
                         # Timeout → ignora e vai para próximo (se houver)
                         elif "timeout" in error_msg:
                             logger.warning(f"⏭️ [{model_index}]{batch_label} Timeout no bot {attempt_bot_id}, pulando batch...")
+
+                            # Marca itens como completed com timeout (não como falha)
+                            for data in ready_items:
+                                self.queue_repo.mark_completed_with_timeout(
+                                    data["item"]["id"],
+                                    f"Timeout ao enviar"
+                                )
+
                             raise
 
                         # Outros erros → para imediatamente
@@ -699,10 +707,16 @@ class PublisherServiceV3:
                             raise
 
                     except asyncio.TimeoutError:
-                        logger.warning(f"⏭️ [{model_index}]{batch_label} Timeout asyncio no bot {attempt_bot_id}, ignorando...")
-                        if len(bots_to_try) == 1 or attempt_bot_id == bots_to_try[-1][0]:
-                            raise
-                        continue
+                        logger.warning(f"⏭️ [{model_index}]{batch_label} Timeout asyncio no bot {attempt_bot_id}, pulando batch...")
+
+                        # Marca itens como completed com timeout (não como falha)
+                        for data in ready_items:
+                            self.queue_repo.mark_completed_with_timeout(
+                                data["item"]["id"],
+                                f"Timeout asyncio"
+                            )
+
+                        raise
 
                 # Se todos os bots deram rate limit, desiste
                 if results is None:

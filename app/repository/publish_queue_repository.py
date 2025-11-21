@@ -83,6 +83,13 @@ class PublishQueueRepository(BaseRepository):
             "error_message": error_message
         })
 
+    def mark_completed_with_timeout(self, queue_id: int, timeout_message: str = "Timeout"):
+        """Marca item como completado mas com aviso de timeout"""
+        return self.update(queue_id, {
+            "status": "completed",
+            "error_message": timeout_message
+        })
+
     def retry_item(self, queue_id: int):
         """Recoloca item na fila para retry"""
         return self.update(queue_id, {"status": "pending"})
