@@ -447,61 +447,40 @@ class PublisherServiceV3:
 
         logger.info(f"🤖 {len(bot_services)} bots disponíveis para rotação")
 
-        # Prepara TODOS os batches de TODOS os modelos
-        all_batches = []
+        # NOVA LÓGICA: Processa modelos completos em paralelo
+        # Cada modelo processará TODOS os seus batches antes de terminar
 
-        for model_id, model_items in items_by_model.items():
-            info = model_info[model_id]
+        # Embaralha a ordem dos modelos (mas cada modelo mantém seus batches intactos)
+        model_ids = list(items_by_model.keys())
+        random.shuffle(model_ids)
 
-            # Divide em batches
-            num_batches = (len(model_items) + batch_size - 1) // batch_size
-
-            for batch_idx in range(num_batches):
-                start = batch_idx * batch_size
-                end = min(start + batch_size, len(model_items))
-                batch = model_items[start:end]
-
-                all_batches.append({
-                    "model_id": model_id,
-                    "info": info,
-                    "items": batch,
-                    "batch_num": batch_idx + 1,
-                    "total_batches": num_batches
-                })
-
-        # Embaralha batches para intercalar modelos
-        random.shuffle(all_batches)
-
-        total_batches = len(all_batches)
-        logger.info(f"📦 {total_batches} batches totais para processar")
-
-        # Processa batches em paralelo com limite de workers
         total_processed = 0
         total_failed = 0
 
-        # Processa em chunks do tamanho de model_workers
-        for chunk_start in range(0, total_batches, self.model_workers):
-            chunk_end = min(chunk_start + self.model_workers, total_batches)
-            chunk = all_batches[chunk_start:chunk_end]
+        # Processa modelos em chunks (limitado por model_workers)
+        for chunk_start in range(0, len(model_ids), self.model_workers):
+            chunk_end = min(chunk_start + self.model_workers, len(model_ids))
+            chunk_model_ids = model_ids[chunk_start:chunk_end]
 
-            # Processa este chunk em paralelo
+            logger.info(f"🔄 Processando chunk de {len(chunk_model_ids)} modelos em paralelo")
+
+            # Processa cada modelo do chunk em paralelo
             results = await asyncio.gather(*[
-                self._process_single_model(
-                    bot_services[i % len(bot_services)][1],  # Rotaciona bots
-                    bot_services[i % len(bot_services)][0],  # bot_id
+                self._process_single_model_complete(
+                    bot_services[i % len(bot_services)],
                     group_id,
-                    batch["items"],
-                    batch["info"],
-                    model_index=chunk_start + i,
-                    batch_info=f"{batch['batch_num']}/{batch['total_batches']}"
+                    items_by_model[model_id],
+                    model_info[model_id],
+                    batch_size,
+                    model_index=chunk_start + i
                 )
-                for i, batch in enumerate(chunk)
+                for i, model_id in enumerate(chunk_model_ids)
             ], return_exceptions=True)
 
             # Consolida resultados
             for result in results:
                 if isinstance(result, Exception):
-                    logger.error(f"❌ Erro em batch: {result}")
+                    logger.error(f"❌ Erro em modelo: {result}")
                     continue
                 processed, failed = result
                 total_processed += processed
@@ -509,14 +488,66 @@ class PublisherServiceV3:
 
         logger.info(f"✅ Paralelo concluído: {total_processed} ok, {total_failed} falhas")
 
-    async def _process_single_model(self, bot_service: BotServiceV2, bot_id: int,
+
+    async def _process_single_model_complete(self, bot_service_tuple: tuple,
+                                             group_id: int, all_items: List[Dict],
+                                             info: Dict, batch_size: int, model_index: int) -> tuple:
+        """Processa TODOS os batches de um modelo de forma sequencial"""
+
+        bot_id, bot_service = bot_service_tuple
+        model_name = info['full_name']
+
+        # Divide em batches
+        num_batches = (len(all_items) + batch_size - 1) // batch_size
+
+        logger.info(f"👤 [{model_index}] {model_name}: {len(all_items)} mídias em {num_batches} batch(es)")
+
+        total_processed = 0
+        total_failed = 0
+
+        # Processa cada batch deste modelo sequencialmente
+        for batch_idx in range(num_batches):
+            start = batch_idx * batch_size
+            end = min(start + batch_size, len(all_items))
+            batch_items = all_items[start:end]
+
+            batch_info = f"{batch_idx + 1}/{num_batches}"
+
+            try:
+                processed, failed = await self._process_single_batch(
+                    bot_service,
+                    bot_id,
+                    group_id,
+                    batch_items,
+                    info,
+                    model_index,
+                    batch_info
+                )
+
+                total_processed += processed
+                total_failed += failed
+
+                # Intervalo entre batches do mesmo modelo
+                if batch_idx < num_batches - 1:
+                    await asyncio.sleep(self.min_interval)
+
+            except Exception as e:
+                logger.error(f"❌ [{model_index}] Erro no batch {batch_info}: {e}")
+                total_failed += len(batch_items)
+
+        logger.info(f"✅ [{model_index}] {model_name} completo: {total_processed} ok, {total_failed} falhas")
+
+        return (total_processed, total_failed)
+
+
+    async def _process_single_batch(self, bot_service: BotServiceV2, bot_id: int,
                                     group_id: int, items: List[Dict],
                                     info: Dict, model_index: int, batch_info: str = "") -> tuple:
-        """Processa um modelo completo (download + thumb + envio)"""
+        """Processa um único batch (era _process_single_model)"""
 
         model_name = info['full_name']
         batch_label = f" [Batch {batch_info}]" if batch_info else ""
-        logger.info(f"👤 [{model_index}] Iniciando: {model_name}{batch_label} ({len(items)} mídias)")
+        logger.info(f"📦 [{model_index}] Processando{batch_label}: {len(items)} mídias")
 
         # Prepara lista de downloads
         download_items = []
@@ -628,20 +659,18 @@ class PublisherServiceV3:
                         self.queue_repo.mark_completed(data["item"]["id"])
                         self._log_action(publish_id["id"], "published", {
                             "via": "parallel",
-                            "model": info['stage_name']
+                            "model": info['stage_name'],
+                            "batch": batch_info
                         })
                         processed += 1
 
                 self.stats_repo.increment_published(group_id, processed)
-                logger.info(f"✅ [{model_index}] {model_name}: {processed} mídias")
-
-                # Intervalo mínimo entre envios
-                await asyncio.sleep(self.min_interval)
+                logger.info(f"✅ [{model_index}]{batch_label} enviado: {processed} mídias")
 
                 return (processed, failed_count)
 
             except BotApiError as e:
-                logger.error(f"❌ [{model_index}] Erro ao enviar: {e}")
+                logger.error(f"❌ [{model_index}]{batch_label} Erro ao enviar: {e}")
 
                 for data in ready_items:
                     self.queue_repo.mark_failed(data["item"]["id"], str(e))
@@ -659,7 +688,6 @@ class PublisherServiceV3:
                                 os.remove(path)
                             except:
                                 pass
-
     # =====================================================
     # MODO SEQUENCIAL (fallback)
     # =====================================================
