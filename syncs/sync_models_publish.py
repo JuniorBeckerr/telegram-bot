@@ -59,7 +59,7 @@ class SyncModelsPublish:
             Lista de models com seus IDs
         """
         logger.info("Buscando todas as models cadastradas")
-        models = self.models_repo.get()
+        models = self.models_repo.all()
 
         if not models:
             logger.warning("Nenhuma model encontrada no banco de dados")
